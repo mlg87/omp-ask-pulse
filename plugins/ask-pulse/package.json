@@ -1,0 +1,15 @@
+{
+  "name": "omp-ask-pulse",
+  "version": "1.0.0",
+  "description": "Pulsing dayglo banner above the omp ask dialog so a waiting agent is impossible to miss.",
+  "license": "MIT",
+  "omp": {
+    "extensions": [
+      "./src/ask-pulse.ts"
+    ]
+  },
+  "devDependencies": {
+    "@oh-my-pi/pi-coding-agent": "*",
+    "@oh-my-pi/pi-tui": "*"
+  }
+}

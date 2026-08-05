@@ -1,0 +1,33 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "masongoetz",
+  "owner": {
+    "name": "Mason Goetz"
+  },
+  "metadata": {
+    "description": "omp plugins by Mason Goetz",
+    "version": "1.0.0",
+    "pluginRoot": "./plugins"
+  },
+  "plugins": [
+    {
+      "name": "ask-pulse",
+      "description": "Pulsing dayglo banner above the omp ask dialog so a waiting agent is impossible to miss.",
+      "source": "./ask-pulse",
+      "version": "1.0.0",
+      "author": {
+        "name": "Mason Goetz"
+      },
+      "category": "productivity",
+      "license": "MIT",
+      "keywords": [
+        "tui",
+        "ask",
+        "notification",
+        "extension"
+      ],
+      "homepage": "https://github.com/masongoetz/omp-ask-pulse",
+      "repository": "https://github.com/masongoetz/omp-ask-pulse"
+    }
+  ]
+}
