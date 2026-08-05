@@ -69,7 +69,8 @@ Compile-time knobs still living in `src/ask-pulse.ts`: `FRAME_MS` (repaint tick)
 - If `tool_execution_end` is skipped (Esc-aborted ask), `agent_end` and `session_shutdown`
   clear the banner.
 - Colors are 24-bit truecolor; non-truecolor terminals approximate.
-- All imports are type-only, so the module has zero runtime resolution cost.
+- The only runtime imports are `bun` and `node:*` builtins; every omp package import is
+  type-only, so the module resolves nothing from a package tree.
 
 ## Local development
 
@@ -77,6 +78,13 @@ Point omp at a working copy instead of the published cache, then restart the ses
 
 ```
 omp plugin link ./plugins/ask-pulse
+```
+
+```
+bun install
+bun run lint        # biome
+bun run typecheck   # tsc --strict
+bun run test        # bun test
 ```
 
 `scripts/frame.html` renders one preview frame; it mirrors the color and glyph math in

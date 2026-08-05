@@ -29,12 +29,13 @@
 // "Failed to load pi_natives native addon"). Text measuring and wrapping are therefore done
 // locally with bun's own `stringWidth` instead of pi-tui's helpers. Runtime builtins are exempt
 // from the rule above — `bun` and `node:*` resolve from the runtime, not from a package tree.
-import { stringWidth } from "bun"
+
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@oh-my-pi/pi-coding-agent"
 import type { Component, TUI } from "@oh-my-pi/pi-tui"
+import { stringWidth } from "bun"
 
 const WIDGET_KEY = "ask-pulse"
 const TITLE = " WAITING FOR YOUR INPUT "
@@ -397,7 +398,10 @@ export default function askPulse(pi: ExtensionAPI) {
         case "color": {
           const color = parseColor(value)
           if (color === undefined) {
-            ctx.ui.notify(`Unrecognized color "${value}". Use a hex value or: ${Object.keys(PRESETS).join(", ")}`, "error")
+            ctx.ui.notify(
+              `Unrecognized color "${value}". Use a hex value or: ${Object.keys(PRESETS).join(", ")}`,
+              "error",
+            )
             return
           }
           const path = writeUserConfig({ color: toHex(color) })
