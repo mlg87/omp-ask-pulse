@@ -1,4 +1,4 @@
-// Ask Pulse — pulsing dayglo-green "waiting for your input" banner for omp `ask` calls.
+// Ask Pulse — pulsing dayglo "waiting for your input" banner for omp `ask` calls.
 //
 // WHY this is an extension and not a patch: the ask dialog's own border is painted with the
 // static theme token `theme.fg("border", …)` in `src/modes/components/overlay-box.ts`, and
@@ -31,8 +31,8 @@ const WIDGET_KEY = "ask-pulse"
 const TITLE = " WAITING FOR YOUR INPUT "
 
 // Pulse endpoints. Swap these two to recolor the whole banner.
-const DIM: RGB = [0x12, 0x3d, 0x0a]
-const DAYGLO: RGB = [0x39, 0xff, 0x14] // "dayglo green"
+const DIM: RGB = [0x3d, 0x0a, 0x33]
+const DAYGLO: RGB = [0xff, 0x10, 0xf0] // "dayglo pink"
 
 const PULSE_PERIOD_MS = 1200 // ~0.83 Hz
 const FRAME_MS = 100 // render tick; phase is derived from wall clock, not from tick count

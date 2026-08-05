@@ -6,7 +6,7 @@
   },
   "metadata": {
     "description": "omp plugins by Mason Goetz",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "pluginRoot": "./plugins"
   },
   "plugins": [
@@ -14,7 +14,7 @@
       "name": "ask-pulse",
       "description": "Pulsing dayglo banner above the omp ask dialog so a waiting agent is impossible to miss.",
       "source": "./ask-pulse",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "author": {
         "name": "Mason Goetz"
       },
