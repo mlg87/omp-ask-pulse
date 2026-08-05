@@ -29,17 +29,37 @@ Or, without the marketplace, drop `src/ask-pulse.ts` into `~/.omp/agent/extensio
 
 ## Configuration
 
-Recolor by swapping the two pulse endpoints at the top of `src/ask-pulse.ts`. The default
-is dayglo pink:
+No source edits — a marketplace install lives in a plugin cache that `omp plugin upgrade`
+overwrites. Use the slash command:
 
-```ts
-const DIM: RGB = [0x3d, 0x0a, 0x33]
-const DAYGLO: RGB = [0xff, 0x10, 0xf0] // "dayglo pink"
+```
+/ask-pulse show                 print the active palette and where it came from
+/ask-pulse color pink           preset: pink green cyan amber violet red
+/ask-pulse color #39ff14        or any #rgb / #rrggbb hex
+/ask-pulse period 800           pulse cycle in ms (min 100)
+/ask-pulse preview              mount the banner for four seconds
+/ask-pulse reset                delete the user config
 ```
 
-Dayglo green: `DIM = [0x12, 0x3d, 0x0a]`, `DAYGLO = [0x39, 0xff, 0x14]`.
+`color` and `period` persist to `~/.omp/agent/ask-pulse.json`. Precedence, lowest to
+highest:
 
-Other knobs: `PULSE_PERIOD_MS` (cycle length), `FRAME_MS` (tick rate),
+| Source | Example |
+|---|---|
+| built-in default | dayglo pink `#ff10f0` @ 1200 ms |
+| user config | `~/.omp/agent/ask-pulse.json` |
+| project config | `<project>/.omp/ask-pulse.json` |
+| environment | `ASK_PULSE_COLOR=#0af0ff ASK_PULSE_PERIOD_MS=800` |
+
+```json
+{ "color": "#ff10f0", "periodMs": 1200 }
+```
+
+The config is re-read on every ask, so a change lands on the next question — no restart.
+Only the bright endpoint is configurable; the trough is derived from it at 24% brightness,
+so one word recolors the whole banner. A malformed config is ignored rather than fatal.
+
+Compile-time knobs still living in `src/ask-pulse.ts`: `FRAME_MS` (repaint tick),
 `MAX_QUESTIONS`, `MAX_LINES_PER_QUESTION`.
 
 ## Degradation

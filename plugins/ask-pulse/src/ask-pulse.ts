@@ -16,43 +16,151 @@
 //  - RPC/ACP modes only accept string-array widgets, so `setWidget` with a component factory can
 //    throw there. Every call is wrapped in try/catch: silent no-op, never an error.
 //  - If `tool_execution_end` is skipped (e.g. the user aborts the ask with Esc), `agent_end` and
-//    `session_shutdown` clear the banner. Worst case it lingers until the turn ends.
+//    `session_shutdown` clear the banner.
 //  - Colors are emitted as 24-bit truecolor. Non-truecolor terminals approximate; nothing breaks.
 //
-// All imports are type-only, so this file has ZERO runtime module resolution. That is deliberate:
-// `~/.omp/agent/extensions/` sits outside any `node_modules` tree, and a bare runtime specifier
-// resolves to bun's package *cache*, where `@oh-my-pi/pi-tui`'s native addon sibling is absent
-// (verified: importing it there throws "Failed to load pi_natives native addon"). Text measuring
-// and wrapping are therefore done locally with `Bun.stringWidth` instead of pi-tui's helpers.
-import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent"
+// v1.2: the palette is configurable (see `loadPalette`) rather than a source edit, because a
+// marketplace install lives in a read-only plugin cache that `omp plugin upgrade` overwrites.
+//
+// Package imports are type-only, so this file has ZERO runtime module resolution against the
+// omp packages. That is deliberate: `~/.omp/agent/extensions/` sits outside any `node_modules`
+// tree, and a bare runtime specifier resolves to bun's package *cache*, where
+// `@oh-my-pi/pi-tui`'s native addon sibling is absent (verified: importing it there throws
+// "Failed to load pi_natives native addon"). Text measuring and wrapping are therefore done
+// locally with bun's own `stringWidth` instead of pi-tui's helpers. Runtime builtins are exempt
+// from the rule above — `bun` and `node:*` resolve from the runtime, not from a package tree.
+import { stringWidth } from "bun"
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { homedir } from "node:os"
+import { join } from "node:path"
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@oh-my-pi/pi-coding-agent"
 import type { Component, TUI } from "@oh-my-pi/pi-tui"
 
 const WIDGET_KEY = "ask-pulse"
 const TITLE = " WAITING FOR YOUR INPUT "
+const CONFIG_BASENAME = "ask-pulse.json"
 
-// Pulse endpoints. Swap these two to recolor the whole banner.
-const DIM: RGB = [0x3d, 0x0a, 0x33]
-const DAYGLO: RGB = [0xff, 0x10, 0xf0] // "dayglo pink"
-
-const PULSE_PERIOD_MS = 1200 // ~0.83 Hz
 const FRAME_MS = 100 // render tick; phase is derived from wall clock, not from tick count
 const MAX_QUESTIONS = 3
 const MAX_LINES_PER_QUESTION = 3
 const MIN_WIDTH = 8
+const PREVIEW_MS = 4000
 
 type RGB = readonly [number, number, number]
 
+/** Resolved pulse appearance: the two interpolation endpoints and the cycle length. */
+interface Palette {
+  dim: RGB
+  bright: RGB
+  periodMs: number
+}
+
+const DEFAULT_BRIGHT: RGB = [0xff, 0x10, 0xf0] // "dayglo pink"
+const DEFAULT_PERIOD_MS = 1200 // ~0.83 Hz
+
+/** Named endpoints, so `/ask-pulse color pink` beats memorising a hex triplet. */
+const PRESETS: Readonly<Record<string, RGB>> = {
+  pink: DEFAULT_BRIGHT,
+  green: [0x39, 0xff, 0x14],
+  cyan: [0x0a, 0xf0, 0xff],
+  amber: [0xff, 0xb0, 0x00],
+  violet: [0xa9, 0x4c, 0xff],
+  red: [0xff, 0x30, 0x3c],
+}
+
+/**
+ * The dim endpoint is derived, not configured, so a one-word color change stays one word. 0.24
+ * keeps the trough visible on a dark terminal without competing with the theme's own borders.
+ */
+export function deriveDim(bright: RGB): RGB {
+  return [Math.round(bright[0] * 0.24), Math.round(bright[1] * 0.24), Math.round(bright[2] * 0.24)]
+}
+
+/** Accepts `#rgb`, `#rrggbb`, either without the hash, or a {@link PRESETS} name. */
+export function parseColor(raw: unknown): RGB | undefined {
+  if (typeof raw !== "string") return undefined
+  const value = raw.trim().toLowerCase()
+  if (value === "") return undefined
+  const preset = PRESETS[value]
+  if (preset !== undefined) return preset
+
+  const hex = value.startsWith("#") ? value.slice(1) : value
+  if (hex.length === 3 && /^[0-9a-f]{3}$/.test(hex)) {
+    const [r, g, b] = [...hex].map((c) => Number.parseInt(c + c, 16))
+    return [r as number, g as number, b as number]
+  }
+  if (hex.length === 6 && /^[0-9a-f]{6}$/.test(hex)) {
+    return [
+      Number.parseInt(hex.slice(0, 2), 16),
+      Number.parseInt(hex.slice(2, 4), 16),
+      Number.parseInt(hex.slice(4, 6), 16),
+    ]
+  }
+  return undefined
+}
+
+function toHex(color: RGB): string {
+  return `#${color.map((c) => c.toString(16).padStart(2, "0")).join("")}`
+}
+
+/** The active profile's agent directory — `PI_CODING_AGENT_DIR` wins, matching omp's own resolution. */
+const AGENT_DIR = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".omp", "agent")
+const USER_CONFIG_PATH = join(AGENT_DIR, CONFIG_BASENAME)
+
+function readConfigFile(path: string): Record<string, unknown> {
+  try {
+    if (!existsSync(path)) return {}
+    const parsed: unknown = JSON.parse(readFileSync(path, "utf8"))
+    return typeof parsed === "object" && parsed !== null ? (parsed as Record<string, unknown>) : {}
+  } catch {
+    return {} // A hand-edited config with a typo must never break the ask dialog.
+  }
+}
+
+/**
+ * Precedence, lowest to highest: built-in default, user config, project config, environment.
+ * Re-read on every ask, so an edit takes effect on the next question rather than the next session
+ * — a marketplace install cannot be source-edited, which is the whole point of this layer.
+ */
+export function loadPalette(cwd: string): Palette {
+  const sources = [
+    readConfigFile(USER_CONFIG_PATH),
+    readConfigFile(join(cwd, ".omp", CONFIG_BASENAME)),
+    { color: process.env.ASK_PULSE_COLOR, periodMs: process.env.ASK_PULSE_PERIOD_MS },
+  ]
+
+  let bright = DEFAULT_BRIGHT
+  let periodMs = DEFAULT_PERIOD_MS
+  for (const source of sources) {
+    const color = parseColor(source.color)
+    if (color !== undefined) bright = color
+    const period = Number(source.periodMs)
+    if (Number.isFinite(period) && period >= 100) periodMs = period
+  }
+  return { dim: deriveDim(bright), bright, periodMs }
+}
+
+/** Persist a partial config to the user file, preserving unrelated keys. */
+function writeUserConfig(patch: Record<string, unknown>): string {
+  const merged = { ...readConfigFile(USER_CONFIG_PATH), ...patch }
+  for (const [key, value] of Object.entries(merged)) if (value === undefined) delete merged[key]
+  mkdirSync(AGENT_DIR, { recursive: true })
+  writeFileSync(USER_CONFIG_PATH, `${JSON.stringify(merged, null, 2)}\n`)
+  return USER_CONFIG_PATH
+}
+
 /** Linear per-channel interpolation, emitted as a truecolor SGR pair. */
-function paint(text: string, t: number): string {
-  const r = Math.round(DIM[0] + (DAYGLO[0] - DIM[0]) * t)
-  const g = Math.round(DIM[1] + (DAYGLO[1] - DIM[1]) * t)
-  const b = Math.round(DIM[2] + (DAYGLO[2] - DIM[2]) * t)
+function paint(text: string, t: number, palette: Palette): string {
+  const { dim, bright } = palette
+  const r = Math.round(dim[0] + (bright[0] - dim[0]) * t)
+  const g = Math.round(dim[1] + (bright[1] - dim[1]) * t)
+  const b = Math.round(dim[2] + (bright[2] - dim[2]) * t)
   return `\x1b[38;2;${r};${g};${b}m${text}\x1b[39m`
 }
 
 /** Sine pulse in [0, 1] derived from wall-clock time so frames stay smooth regardless of tick jitter. */
-function pulsePhase(): number {
-  return (1 + Math.sin((Date.now() / PULSE_PERIOD_MS) * 2 * Math.PI)) / 2
+function pulsePhase(periodMs: number): number {
+  return (1 + Math.sin((Date.now() / periodMs) * 2 * Math.PI)) / 2
 }
 
 /**
@@ -66,15 +174,15 @@ function wrapPlain(text: string, width: number): string[] {
   for (const word of text.split(/\s+/)) {
     if (word === "") continue
     const candidate = current === "" ? word : `${current} ${word}`
-    if (Bun.stringWidth(candidate) <= width) {
+    if (stringWidth(candidate) <= width) {
       current = candidate
       continue
     }
     if (current !== "") lines.push(current)
     let rest = word
-    while (Bun.stringWidth(rest) > width) {
+    while (stringWidth(rest) > width) {
       let cut = 0
-      while (cut < rest.length && Bun.stringWidth(rest.slice(0, cut + 1)) <= width) cut++
+      while (cut < rest.length && stringWidth(rest.slice(0, cut + 1)) <= width) cut++
       lines.push(rest.slice(0, Math.max(1, cut)))
       rest = rest.slice(Math.max(1, cut))
     }
@@ -127,15 +235,17 @@ const FALLBACK_GLYPHS: BoxGlyphs = {
  * Rounded box whose border color is recomputed on every render from the wall clock.
  * Wrapped content is cached per width so only the (cheap) paint pass runs per frame.
  */
-class AskPulseBanner implements Component {
+export class AskPulseBanner implements Component {
   readonly #questions: readonly string[]
   readonly #glyphs: BoxGlyphs
+  readonly #palette: Palette
   #cachedWidth = -1
   #cachedBody: string[] = []
 
-  constructor(questions: readonly string[], boxRound: BoxGlyphs) {
+  constructor(questions: readonly string[], boxRound: BoxGlyphs, palette: Palette) {
     this.#questions = questions
     this.#glyphs = boxRound
+    this.#palette = palette
   }
 
   invalidate(): void {
@@ -161,35 +271,45 @@ class AskPulseBanner implements Component {
   }
 
   render(width: number): readonly string[] {
+    const palette = this.#palette
     // Degenerate terminals must not crash the render loop.
-    if (width < MIN_WIDTH) return [paint(TITLE.trim(), pulsePhase())]
+    if (width < MIN_WIDTH) return [paint(TITLE.trim(), pulsePhase(palette.periodMs), palette)]
 
-    const t = pulsePhase()
+    const t = pulsePhase(palette.periodMs)
     const { topLeft, topRight, bottomLeft, bottomRight, horizontal, vertical } = this.#glyphs
     const innerWidth = width - 4 // "│ " + content + " │"
 
     // Top rule with the title inset and centered.
     const ruleWidth = width - 2
-    const titleWidth = Math.min(Bun.stringWidth(TITLE), ruleWidth)
+    const titleWidth = Math.min(stringWidth(TITLE), ruleWidth)
     const title = TITLE.slice(0, titleWidth)
     const leftRule = Math.max(0, Math.floor((ruleWidth - titleWidth) / 2))
     const rightRule = Math.max(0, ruleWidth - titleWidth - leftRule)
     const top = paint(
       `${topLeft}${horizontal.repeat(leftRule)}${title}${horizontal.repeat(rightRule)}${topRight}`,
       t,
+      palette,
     )
 
-    const bar = paint(vertical, t)
+    const bar = paint(vertical, t, palette)
     const lines: string[] = [top]
     for (const line of this.#body(innerWidth)) {
-      const pad = Math.max(0, innerWidth - Bun.stringWidth(line))
+      const pad = Math.max(0, innerWidth - stringWidth(line))
       // Title text stays readable: floor its brightness at the midpoint of the pulse.
-      lines.push(`${bar} ${paint(line, Math.max(0.5, t))}${" ".repeat(pad)} ${bar}`)
+      lines.push(`${bar} ${paint(line, Math.max(0.5, t), palette)}${" ".repeat(pad)} ${bar}`)
     }
-    lines.push(paint(`${bottomLeft}${horizontal.repeat(ruleWidth)}${bottomRight}`, t))
+    lines.push(paint(`${bottomLeft}${horizontal.repeat(ruleWidth)}${bottomRight}`, t, palette))
     return lines
   }
 }
+
+const USAGE = [
+  "/ask-pulse show — print the active palette and where it came from",
+  "/ask-pulse color <hex|pink|green|cyan|amber|violet|red> — set the bright endpoint",
+  "/ask-pulse period <ms> — set the pulse cycle length (min 100)",
+  "/ask-pulse preview — mount the banner for a few seconds",
+  "/ask-pulse reset — delete the user config",
+].join("\n")
 
 export default function askPulse(pi: ExtensionAPI) {
   pi.setLabel("Ask Pulse")
@@ -213,12 +333,8 @@ export default function askPulse(pi: ExtensionAPI) {
     }
   }
 
-  pi.on("tool_execution_start", (event, ctx) => {
-    if (event.toolName !== "ask" || !ctx.hasUI) return
-
-    const questions = extractQuestionLines(event.args)
-    if (questions.length === 0) questions.push("The agent is waiting for your answer.")
-
+  /** Mount the banner and start the repaint tick. Returns false when the surface refuses it. */
+  const mount = (ctx: ExtensionContext, questions: string[], palette: Palette): boolean => {
     try {
       ctx.ui.setWidget(
         WIDGET_KEY,
@@ -226,17 +342,26 @@ export default function askPulse(pi: ExtensionAPI) {
           tuiRef = tui
           // `theme` can be undefined under jiti / dual-module-graph installs (omp issue #5366,
           // the same hazard `dynamic-border.ts` guards). Degrade to glyphs, never crash the TUI.
-          return new AskPulseBanner(questions, theme?.boxRound ?? FALLBACK_GLYPHS)
+          return new AskPulseBanner(questions, theme?.boxRound ?? FALLBACK_GLYPHS, palette)
         },
         { placement: "aboveEditor" },
       )
     } catch {
-      return // Component-factory widgets unsupported here; stay a silent no-op.
+      return false // Component-factory widgets unsupported here; stay a silent no-op.
     }
-
-    activeToolCallId = event.toolCallId
     // The tick only asks for a repaint; the pulse phase comes from the wall clock in render().
     timer = ctx.setInterval(() => tuiRef?.requestRender(), FRAME_MS)
+    return true
+  }
+
+  pi.on("tool_execution_start", (event, ctx) => {
+    if (event.toolName !== "ask" || !ctx.hasUI) return
+
+    const questions = extractQuestionLines(event.args)
+    if (questions.length === 0) questions.push("The agent is waiting for your answer.")
+
+    if (!mount(ctx, questions, loadPalette(ctx.cwd))) return
+    activeToolCallId = event.toolCallId
   })
 
   // `ask` is concurrency-exclusive, so at most one is ever live — matching on either field is safe.
@@ -247,4 +372,64 @@ export default function askPulse(pi: ExtensionAPI) {
   // Safety nets: an aborted ask (Esc) does not necessarily emit `tool_execution_end`.
   pi.on("agent_end", (_event, ctx) => clear(ctx))
   pi.on("session_shutdown", (_event, ctx) => clear(ctx))
+
+  pi.registerCommand("ask-pulse", {
+    description: "Configure the ask-pulse banner (color, period, preview)",
+    handler: async (args: string, ctx: ExtensionCommandContext) => {
+      const [subcommand = "show", ...rest] = args.trim().split(/\s+/).filter(Boolean)
+      const value = rest.join(" ")
+      const palette = loadPalette(ctx.cwd)
+
+      switch (subcommand) {
+        case "show": {
+          const projectPath = join(ctx.cwd, ".omp", CONFIG_BASENAME)
+          const origins = [
+            existsSync(USER_CONFIG_PATH) ? `user: ${USER_CONFIG_PATH}` : undefined,
+            existsSync(projectPath) ? `project: ${projectPath}` : undefined,
+            process.env.ASK_PULSE_COLOR !== undefined ? `env: ASK_PULSE_COLOR` : undefined,
+          ].filter(Boolean)
+          ctx.ui.notify(
+            `ask-pulse ${toHex(palette.bright)} → ${toHex(palette.dim)} @ ${palette.periodMs}ms` +
+              (origins.length > 0 ? ` (${origins.join(", ")})` : " (defaults)"),
+          )
+          return
+        }
+        case "color": {
+          const color = parseColor(value)
+          if (color === undefined) {
+            ctx.ui.notify(`Unrecognized color "${value}". Use a hex value or: ${Object.keys(PRESETS).join(", ")}`, "error")
+            return
+          }
+          const path = writeUserConfig({ color: toHex(color) })
+          ctx.ui.notify(`ask-pulse color → ${toHex(color)} (${path})`)
+          return
+        }
+        case "period": {
+          const ms = Number(value)
+          if (!Number.isFinite(ms) || ms < 100) {
+            ctx.ui.notify(`Period must be a number of milliseconds ≥ 100 (got "${value}")`, "error")
+            return
+          }
+          writeUserConfig({ periodMs: ms })
+          ctx.ui.notify(`ask-pulse period → ${ms}ms`)
+          return
+        }
+        case "preview": {
+          if (!ctx.hasUI) return
+          clear(ctx)
+          if (!mount(ctx, [`Preview — ${toHex(palette.bright)} @ ${palette.periodMs}ms`], palette)) return
+          // No real ask is in flight, so nothing else will tear this down.
+          ctx.setTimeout(() => clear(ctx), PREVIEW_MS)
+          return
+        }
+        case "reset": {
+          if (existsSync(USER_CONFIG_PATH)) rmSync(USER_CONFIG_PATH)
+          ctx.ui.notify(`ask-pulse reset to ${toHex(DEFAULT_BRIGHT)} @ ${DEFAULT_PERIOD_MS}ms`)
+          return
+        }
+        default:
+          ctx.ui.notify(`Unknown subcommand "${subcommand}".\n${USAGE}`, "warning")
+      }
+    },
+  })
 }
