@@ -17,8 +17,8 @@ above the editor container the dialog lives in.
 ## Install
 
 ```
-/marketplace add masongoetz/omp-ask-pulse
-/marketplace install ask-pulse@masongoetz
+/marketplace add mlg87/omp-ask-pulse
+/marketplace install ask-pulse@mlg87
 ```
 
 Restart the session — newly installed extension modules are loaded at startup.

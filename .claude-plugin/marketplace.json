@@ -1,6 +1,6 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
-  "name": "masongoetz",
+  "name": "mlg87",
   "owner": {
     "name": "Mason Goetz"
   },
@@ -26,8 +26,8 @@
         "notification",
         "extension"
       ],
-      "homepage": "https://github.com/masongoetz/omp-ask-pulse",
-      "repository": "https://github.com/masongoetz/omp-ask-pulse"
+      "homepage": "https://github.com/mlg87/omp-ask-pulse",
+      "repository": "https://github.com/mlg87/omp-ask-pulse"
     }
   ]
 }

@@ -1,10 +1,10 @@
-# masongoetz omp marketplace
+# mlg87 omp marketplace
 
 An [omp](https://github.com/oh-my-pi/pi-coding-agent) plugin marketplace.
 
 ```
-/marketplace add masongoetz/omp-ask-pulse
-/marketplace discover masongoetz
+/marketplace add mlg87/omp-ask-pulse
+/marketplace discover mlg87
 ```
 
 | Plugin | Description |
@@ -14,14 +14,14 @@ An [omp](https://github.com/oh-my-pi/pi-coding-agent) plugin marketplace.
 Install one:
 
 ```
-/marketplace install ask-pulse@masongoetz
+/marketplace install ask-pulse@mlg87
 ```
 
 ## Local development
 
 ```
 /marketplace add ./omp-ask-pulse
-/marketplace install --force ask-pulse@masongoetz
+/marketplace install --force ask-pulse@mlg87
 ```
 
 The catalog is published at both `.omp-plugin/marketplace.json` (read by omp) and
