@@ -1,7 +1,7 @@
 {
   "name": "omp-ask-pulse",
-  "version": "1.2.1",
-  "description": "Pulsing dayglo banner above the omp ask dialog so a waiting agent is impossible to miss.",
+  "version": "1.3.0",
+  "description": "Pulsing dayglo banner for a waiting omp agent: a rule on every yielded turn, a boxed banner during ask.",
   "license": "MIT",
   "omp": {
     "extensions": [

@@ -16,7 +16,7 @@ delete process.env.ASK_PULSE_COLOR
 delete process.env.ASK_PULSE_PERIOD_MS
 
 // Dynamic: the module reads PI_CODING_AGENT_DIR at init, which the lines above must win.
-const { parseColor, deriveDim, loadPalette, AskPulseBanner } = await import("./ask-pulse.ts")
+const { parseColor, deriveDim, loadConfig, AskPulseBanner } = await import("./ask-pulse.ts")
 
 const hex = (color: readonly number[]) => `#${color.map((c) => c.toString(16).padStart(2, "0")).join("")}`
 const userConfig = join(agentDir, "ask-pulse.json")
@@ -51,48 +51,76 @@ test("deriveDim scales every channel to 24%", () => {
   expect(hex(deriveDim([0xff, 0x10, 0xf0]))).toBe("#3d043a")
 })
 
-describe("loadPalette precedence", () => {
+describe("loadConfig precedence", () => {
   beforeAll(() => {
     rmSync(userConfig, { force: true })
     rmSync(projectConfig, { force: true })
   })
 
   test("falls back to the built-in dayglo pink", () => {
-    const palette = loadPalette(projectDir)
+    const palette = loadConfig(projectDir).palette
     expect(hex(palette.bright)).toBe("#ff10f0")
     expect(palette.periodMs).toBe(1200)
   })
 
   test("user config beats the default", () => {
     writeFileSync(userConfig, JSON.stringify({ color: "green", periodMs: 800 }))
-    const palette = loadPalette(projectDir)
+    const palette = loadConfig(projectDir).palette
     expect(hex(palette.bright)).toBe("#39ff14")
     expect(palette.periodMs).toBe(800)
   })
 
   test("project config beats user config, per field", () => {
     writeFileSync(projectConfig, JSON.stringify({ color: "cyan" }))
-    const palette = loadPalette(projectDir)
+    const palette = loadConfig(projectDir).palette
     expect(hex(palette.bright)).toBe("#0af0ff")
     expect(palette.periodMs).toBe(800) // untouched by the project file
   })
 
   test("environment beats every file", () => {
     process.env.ASK_PULSE_COLOR = "#123456"
-    expect(hex(loadPalette(projectDir).bright)).toBe("#123456")
+    expect(hex(loadConfig(projectDir).palette.bright)).toBe("#123456")
     delete process.env.ASK_PULSE_COLOR
   })
 
   test("malformed JSON is ignored rather than fatal", () => {
     writeFileSync(projectConfig, "{ not json")
-    expect(hex(loadPalette(projectDir).bright)).toBe("#39ff14") // user config still applies
+    expect(hex(loadConfig(projectDir).palette.bright)).toBe("#39ff14") // user config still applies
   })
 
   test("unparseable colors and sub-100ms periods are ignored", () => {
     writeFileSync(projectConfig, JSON.stringify({ color: "nonsense", periodMs: 5 }))
-    const palette = loadPalette(projectDir)
+    const palette = loadConfig(projectDir).palette
     expect(hex(palette.bright)).toBe("#39ff14")
     expect(palette.periodMs).toBe(800)
+  })
+})
+
+describe("loadConfig idle toggle", () => {
+  beforeAll(() => {
+    rmSync(userConfig, { force: true })
+    rmSync(projectConfig, { force: true })
+    delete process.env.ASK_PULSE_IDLE
+  })
+
+  test("defaults to on, because the whole point is not missing a yielded turn", () => {
+    expect(loadConfig(projectDir).idle).toBe(true)
+  })
+
+  test("a JSON boolean turns it off", () => {
+    writeFileSync(userConfig, JSON.stringify({ idle: false }))
+    expect(loadConfig(projectDir).idle).toBe(false)
+  })
+
+  test("the environment accepts the usual falsey spellings and overrides the file", () => {
+    for (const off of ["0", "false", "off", "no", "OFF"]) {
+      process.env.ASK_PULSE_IDLE = off
+      expect(loadConfig(projectDir).idle).toBe(false)
+    }
+    process.env.ASK_PULSE_IDLE = "1"
+    expect(loadConfig(projectDir).idle).toBe(true) // beats the `idle: false` user config
+    delete process.env.ASK_PULSE_IDLE
+    rmSync(userConfig, { force: true })
   })
 })
 
@@ -142,5 +170,18 @@ describe("AskPulseBanner.render", () => {
     const lines = long.render(40) as string[]
     expect(lines).toHaveLength(5) // top rule + 3 body lines (the cap) + bottom rule
     expect(plain(lines[3] as string)).toContain("…")
+  })
+
+  test("collapses to one full-width titled rule when there are no questions", () => {
+    const idle = new AskPulseBanner([], glyphs, palette)
+    const lines = idle.render(40) as string[]
+    expect(lines).toHaveLength(1)
+    const only = plain(lines[0] as string)
+    expect(Bun.stringWidth(only)).toBe(40)
+    expect(only).toContain("WAITING FOR YOUR INPUT")
+    // A rule, not a box: no corner glyphs anywhere on the line.
+    expect(only).not.toContain(glyphs.topLeft)
+    expect(only).not.toContain(glyphs.topRight)
+    expect(only.startsWith(glyphs.horizontal)).toBe(true)
   })
 })

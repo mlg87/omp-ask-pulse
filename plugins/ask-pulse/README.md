@@ -1,7 +1,17 @@
 # ask-pulse
 
-A pulsing dayglo banner that mounts directly above the omp `ask` dialog, so an agent
-waiting on your input is impossible to miss in a wall of terminal panes.
+A pulsing dayglo banner for a waiting agent, mounted directly above the editor so it is the
+last thing on screen — impossible to miss in a wall of terminal panes.
+
+Two modes, both pinned below all transcript output:
+
+- **ask** — a rounded box carrying the questions, for the whole life of an `ask` dialog.
+- **idle** — a single titled rule, whenever the agent yields the turn at all, including a
+  plain prose answer that never called `ask`. Cleared the moment you submit.
+
+Wrapping the assistant's actual response text is not possible from an extension:
+`registerMessageRenderer` only accepts custom message types, and decorating real transcript
+blocks would mean patching `AssistantMessageComponent` — see below for why that is refused.
 
 ![ask-pulse in action](docs/ask-pulse.gif)
 
@@ -37,11 +47,12 @@ overwrites. Use the slash command:
 /ask-pulse color pink           preset: pink green cyan amber violet red
 /ask-pulse color #39ff14        or any #rgb / #rrggbb hex
 /ask-pulse period 800           pulse cycle in ms (min 100)
+/ask-pulse idle off             stop pulsing on plain end-of-turn (ask still pulses)
 /ask-pulse preview              mount the banner for four seconds
 /ask-pulse reset                delete the user config
 ```
 
-`color` and `period` persist to `~/.omp/agent/ask-pulse.json`. Precedence, lowest to
+`color`, `period`, and `idle` persist to `~/.omp/agent/ask-pulse.json`. Precedence, lowest to
 highest:
 
 | Source | Example |
@@ -49,13 +60,13 @@ highest:
 | built-in default | dayglo pink `#ff10f0` @ 1200 ms |
 | user config | `~/.omp/agent/ask-pulse.json` |
 | project config | `<project>/.omp/ask-pulse.json` |
-| environment | `ASK_PULSE_COLOR=#0af0ff ASK_PULSE_PERIOD_MS=800` |
+| environment | `ASK_PULSE_COLOR=#0af0ff ASK_PULSE_PERIOD_MS=800 ASK_PULSE_IDLE=0` |
 
 ```json
-{ "color": "#ff10f0", "periodMs": 1200 }
+{ "color": "#ff10f0", "periodMs": 1200, "idle": true }
 ```
 
-The config is re-read on every ask, so a change lands on the next question — no restart.
+The config is re-read on every mount, so a change lands on the next turn — no restart.
 Only the bright endpoint is configurable; the trough is derived from it at 24% brightness,
 so one word recolors the whole banner. A malformed config is ignored rather than fatal.
 

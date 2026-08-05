@@ -19,7 +19,7 @@
 //    `session_shutdown` clear the banner.
 //  - Colors are emitted as 24-bit truecolor. Non-truecolor terminals approximate; nothing breaks.
 //
-// v1.2: the palette is configurable (see `loadPalette`) rather than a source edit, because a
+// v1.2: the palette is configurable (see `loadConfig`) rather than a source edit, because a
 // marketplace install lives in a read-only plugin cache that `omp plugin upgrade` overwrites.
 //
 // Package imports are type-only, so this file has ZERO runtime module resolution against the
@@ -118,27 +118,37 @@ function readConfigFile(path: string): Record<string, unknown> {
   }
 }
 
+/** Everything the runtime reads from disk: appearance plus the idle-pulse toggle. */
+export interface PulseConfig {
+  palette: Palette
+  idle: boolean
+}
+
 /**
  * Precedence, lowest to highest: built-in default, user config, project config, environment.
- * Re-read on every ask, so an edit takes effect on the next question rather than the next session
+ * Re-read on every mount, so an edit takes effect on the next turn rather than the next session
  * — a marketplace install cannot be source-edited, which is the whole point of this layer.
  */
-export function loadPalette(cwd: string): Palette {
+export function loadConfig(cwd: string): PulseConfig {
   const sources = [
     readConfigFile(USER_CONFIG_PATH),
     readConfigFile(join(cwd, ".omp", CONFIG_BASENAME)),
-    { color: process.env.ASK_PULSE_COLOR, periodMs: process.env.ASK_PULSE_PERIOD_MS },
+    { color: process.env.ASK_PULSE_COLOR, periodMs: process.env.ASK_PULSE_PERIOD_MS, idle: process.env.ASK_PULSE_IDLE },
   ]
 
   let bright = DEFAULT_BRIGHT
   let periodMs = DEFAULT_PERIOD_MS
+  let idle = true
   for (const source of sources) {
     const color = parseColor(source.color)
     if (color !== undefined) bright = color
     const period = Number(source.periodMs)
     if (Number.isFinite(period) && period >= 100) periodMs = period
+    // Accept booleans from JSON and "0"/"false" from the environment, ignore anything else.
+    if (typeof source.idle === "boolean") idle = source.idle
+    else if (typeof source.idle === "string" && source.idle !== "") idle = !/^(0|false|off|no)$/i.test(source.idle)
   }
-  return { dim: deriveDim(bright), bright, periodMs }
+  return { palette: { dim: deriveDim(bright), bright, periodMs }, idle }
 }
 
 /** Persist a partial config to the user file, preserving unrelated keys. */
@@ -276,6 +286,17 @@ export class AskPulseBanner implements Component {
     // Degenerate terminals must not crash the render loop.
     if (width < MIN_WIDTH) return [paint(TITLE.trim(), pulsePhase(palette.periodMs), palette)]
 
+    // Idle mode: no questions to show, so the banner collapses to a single titled rule that sits
+    // directly above the editor without competing with the response text it follows.
+    if (this.#questions.length === 0) {
+      const t = pulsePhase(palette.periodMs)
+      const titleWidth = Math.min(stringWidth(TITLE), width)
+      const left = Math.max(0, Math.floor((width - titleWidth) / 2))
+      const right = Math.max(0, width - titleWidth - left)
+      const { horizontal } = this.#glyphs
+      return [paint(`${horizontal.repeat(left)}${TITLE.slice(0, titleWidth)}${horizontal.repeat(right)}`, t, palette)]
+    }
+
     const t = pulsePhase(palette.periodMs)
     const { topLeft, topRight, bottomLeft, bottomRight, horizontal, vertical } = this.#glyphs
     const innerWidth = width - 4 // "│ " + content + " │"
@@ -308,6 +329,7 @@ const USAGE = [
   "/ask-pulse show — print the active palette and where it came from",
   "/ask-pulse color <hex|pink|green|cyan|amber|violet|red> — set the bright endpoint",
   "/ask-pulse period <ms> — set the pulse cycle length (min 100)",
+  "/ask-pulse idle <on|off> — pulse a rule above the editor whenever the agent yields the turn",
   "/ask-pulse preview — mount the banner for a few seconds",
   "/ask-pulse reset — delete the user config",
 ].join("\n")
@@ -361,7 +383,7 @@ export default function askPulse(pi: ExtensionAPI) {
     const questions = extractQuestionLines(event.args)
     if (questions.length === 0) questions.push("The agent is waiting for your answer.")
 
-    if (!mount(ctx, questions, loadPalette(ctx.cwd))) return
+    if (!mount(ctx, questions, loadConfig(ctx.cwd).palette)) return
     activeToolCallId = event.toolCallId
   })
 
@@ -370,8 +392,17 @@ export default function askPulse(pi: ExtensionAPI) {
     if (event.toolCallId === activeToolCallId || event.toolName === "ask") clear(ctx)
   })
 
-  // Safety nets: an aborted ask (Esc) does not necessarily emit `tool_execution_end`.
-  pi.on("agent_end", (_event, ctx) => clear(ctx))
+  // The agent has yielded the turn: every path back to the user ends here, including a plain
+  // prose answer that never called `ask`. An empty question list renders the one-line rule.
+  pi.on("agent_end", (_event, ctx) => {
+    clear(ctx) // also the safety net for an Esc-aborted ask, which skips `tool_execution_end`
+    if (!ctx.hasUI) return
+    const config = loadConfig(ctx.cwd)
+    if (config.idle) mount(ctx, [], config.palette)
+  })
+
+  // The user answered, so the wait is over before any output appears.
+  pi.on("agent_start", (_event, ctx) => clear(ctx))
   pi.on("session_shutdown", (_event, ctx) => clear(ctx))
 
   pi.registerCommand("ask-pulse", {
@@ -379,7 +410,7 @@ export default function askPulse(pi: ExtensionAPI) {
     handler: async (args: string, ctx: ExtensionCommandContext) => {
       const [subcommand = "show", ...rest] = args.trim().split(/\s+/).filter(Boolean)
       const value = rest.join(" ")
-      const palette = loadPalette(ctx.cwd)
+      const { palette, idle } = loadConfig(ctx.cwd)
 
       switch (subcommand) {
         case "show": {
@@ -390,9 +421,19 @@ export default function askPulse(pi: ExtensionAPI) {
             process.env.ASK_PULSE_COLOR !== undefined ? `env: ASK_PULSE_COLOR` : undefined,
           ].filter(Boolean)
           ctx.ui.notify(
-            `ask-pulse ${toHex(palette.bright)} → ${toHex(palette.dim)} @ ${palette.periodMs}ms` +
+            `ask-pulse ${toHex(palette.bright)} → ${toHex(palette.dim)} @ ${palette.periodMs}ms, idle ${idle ? "on" : "off"}` +
               (origins.length > 0 ? ` (${origins.join(", ")})` : " (defaults)"),
           )
+          return
+        }
+        case "idle": {
+          if (!/^(on|off)$/i.test(value)) {
+            ctx.ui.notify(`Usage: /ask-pulse idle <on|off> (got "${value}")`, "error")
+            return
+          }
+          const enabled = value.toLowerCase() === "on"
+          writeUserConfig({ idle: enabled })
+          ctx.ui.notify(`ask-pulse idle → ${enabled ? "on" : "off"}`)
           return
         }
         case "color": {
