@@ -48,6 +48,7 @@ overwrites. Use the slash command:
 /ask-pulse color #39ff14        or any #rgb / #rrggbb hex
 /ask-pulse period 800           pulse cycle in ms (min 100)
 /ask-pulse idle off             stop pulsing on plain end-of-turn (ask still pulses)
+/ask-pulse hold 30m             lock bright after this long; 0 pulses forever
 /ask-pulse preview              mount the banner for four seconds
 /ask-pulse reset                delete the user config
 ```
@@ -60,13 +61,20 @@ highest:
 | built-in default | dayglo pink `#ff10f0` @ 1200 ms |
 | user config | `~/.omp/agent/ask-pulse.json` |
 | project config | `<project>/.omp/ask-pulse.json` |
-| environment | `ASK_PULSE_COLOR=#0af0ff ASK_PULSE_PERIOD_MS=800 ASK_PULSE_IDLE=0` |
+| environment | `ASK_PULSE_COLOR=#0af0ff ASK_PULSE_PERIOD_MS=800 ASK_PULSE_IDLE=0 ASK_PULSE_HOLD_AFTER_MS=0` |
 
 ```json
-{ "color": "#ff10f0", "periodMs": 1200, "idle": true }
+{ "color": "#ff10f0", "periodMs": 1200, "idle": true, "holdAfterMs": 1800000 }
 ```
 
 The config is re-read on every mount, so a change lands on the next turn — no restart.
+
+After `holdAfterMs` (default 30 minutes) the banner stops animating and locks at full
+brightness, and the repaint tick is killed — an unattended pane must not repaint at 10 Hz
+overnight. The locked state is just as visible as the pulse once you look at the screen.
+The deadline is re-derived inside `render()`, so a resize or re-layout after the tick dies
+still paints bright. `0` or negative disables the lock.
+
 Only the bright endpoint is configurable; the trough is derived from it at 24% brightness,
 so one word recolors the whole banner. A malformed config is ignored rather than fatal.
 

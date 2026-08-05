@@ -49,15 +49,22 @@ const PREVIEW_MS = 4000
 
 type RGB = readonly [number, number, number]
 
-/** Resolved pulse appearance: the two interpolation endpoints and the cycle length. */
+/** Resolved pulse appearance: the interpolation endpoints, cycle length, and when to stop. */
 interface Palette {
   dim: RGB
   bright: RGB
   periodMs: number
+  /**
+   * Milliseconds of pulsing before the banner locks at full brightness and the repaint tick is
+   * killed. An unattended pane would otherwise repaint at 10 Hz indefinitely; the locked bright
+   * state is just as visible as the pulse once you finally look at the screen. `<= 0` never locks.
+   */
+  holdAfterMs: number
 }
 
 const DEFAULT_BRIGHT: RGB = [0xff, 0x10, 0xf0] // "dayglo pink"
 const DEFAULT_PERIOD_MS = 1200 // ~0.83 Hz
+const DEFAULT_HOLD_AFTER_MS = 30 * 60 * 1000
 
 /** Named endpoints, so `/ask-pulse color pink` beats memorising a hex triplet. */
 const PRESETS: Readonly<Record<string, RGB>> = {
@@ -133,12 +140,18 @@ export function loadConfig(cwd: string): PulseConfig {
   const sources = [
     readConfigFile(USER_CONFIG_PATH),
     readConfigFile(join(cwd, ".omp", CONFIG_BASENAME)),
-    { color: process.env.ASK_PULSE_COLOR, periodMs: process.env.ASK_PULSE_PERIOD_MS, idle: process.env.ASK_PULSE_IDLE },
+    {
+      color: process.env.ASK_PULSE_COLOR,
+      periodMs: process.env.ASK_PULSE_PERIOD_MS,
+      idle: process.env.ASK_PULSE_IDLE,
+      holdAfterMs: process.env.ASK_PULSE_HOLD_AFTER_MS,
+    },
   ]
 
   let bright = DEFAULT_BRIGHT
   let periodMs = DEFAULT_PERIOD_MS
   let idle = true
+  let holdAfterMs = DEFAULT_HOLD_AFTER_MS
   for (const source of sources) {
     const color = parseColor(source.color)
     if (color !== undefined) bright = color
@@ -147,8 +160,13 @@ export function loadConfig(cwd: string): PulseConfig {
     // Accept booleans from JSON and "0"/"false" from the environment, ignore anything else.
     if (typeof source.idle === "boolean") idle = source.idle
     else if (typeof source.idle === "string" && source.idle !== "") idle = !/^(0|false|off|no)$/i.test(source.idle)
+    // `Number("")` is 0, which would mean "lock instantly" — an unset env var must not do that.
+    if (source.holdAfterMs !== undefined && source.holdAfterMs !== "") {
+      const hold = Number(source.holdAfterMs)
+      if (Number.isFinite(hold)) holdAfterMs = hold
+    }
   }
-  return { palette: { dim: deriveDim(bright), bright, periodMs }, idle }
+  return { palette: { dim: deriveDim(bright), bright, periodMs, holdAfterMs }, idle }
 }
 
 /** Persist a partial config to the user file, preserving unrelated keys. */
@@ -250,6 +268,7 @@ export class AskPulseBanner implements Component {
   readonly #questions: readonly string[]
   readonly #glyphs: BoxGlyphs
   readonly #palette: Palette
+  readonly #mountedAt = Date.now()
   #cachedWidth = -1
   #cachedBody: string[] = []
 
@@ -257,6 +276,17 @@ export class AskPulseBanner implements Component {
     this.#questions = questions
     this.#glyphs = boxRound
     this.#palette = palette
+  }
+
+  /**
+   * Phase for this frame, or a hard 1 once the hold window has elapsed. The deadline is checked
+   * here rather than only in the extension's timer so a later repaint — a resize, a re-layout —
+   * still paints the locked bright state after the tick has been killed.
+   */
+  #phase(): number {
+    const { holdAfterMs, periodMs } = this.#palette
+    if (holdAfterMs > 0 && Date.now() - this.#mountedAt >= holdAfterMs) return 1
+    return pulsePhase(periodMs)
   }
 
   invalidate(): void {
@@ -284,12 +314,12 @@ export class AskPulseBanner implements Component {
   render(width: number): readonly string[] {
     const palette = this.#palette
     // Degenerate terminals must not crash the render loop.
-    if (width < MIN_WIDTH) return [paint(TITLE.trim(), pulsePhase(palette.periodMs), palette)]
+    if (width < MIN_WIDTH) return [paint(TITLE.trim(), this.#phase(), palette)]
 
     // Idle mode: no questions to show, so the banner collapses to a single titled rule that sits
     // directly above the editor without competing with the response text it follows.
     if (this.#questions.length === 0) {
-      const t = pulsePhase(palette.periodMs)
+      const t = this.#phase()
       const titleWidth = Math.min(stringWidth(TITLE), width)
       const left = Math.max(0, Math.floor((width - titleWidth) / 2))
       const right = Math.max(0, width - titleWidth - left)
@@ -297,7 +327,7 @@ export class AskPulseBanner implements Component {
       return [paint(`${horizontal.repeat(left)}${TITLE.slice(0, titleWidth)}${horizontal.repeat(right)}`, t, palette)]
     }
 
-    const t = pulsePhase(palette.periodMs)
+    const t = this.#phase()
     const { topLeft, topRight, bottomLeft, bottomRight, horizontal, vertical } = this.#glyphs
     const innerWidth = width - 4 // "│ " + content + " │"
 
@@ -325,11 +355,20 @@ export class AskPulseBanner implements Component {
   }
 }
 
+/** `1800000`, `30m`, `90s`, `2h` → milliseconds. `undefined` when it is not a duration at all. */
+export function parseDuration(raw: string): number | undefined {
+  const match = /^(-?\d+(?:\.\d+)?)(ms|s|m|h)?$/i.exec(raw.trim())
+  if (match === null) return undefined
+  const scale = { ms: 1, s: 1000, m: 60_000, h: 3_600_000 }[match[2]?.toLowerCase() ?? "ms"] ?? 1
+  return Number(match[1]) * scale
+}
+
 const USAGE = [
   "/ask-pulse show — print the active palette and where it came from",
   "/ask-pulse color <hex|pink|green|cyan|amber|violet|red> — set the bright endpoint",
   "/ask-pulse period <ms> — set the pulse cycle length (min 100)",
   "/ask-pulse idle <on|off> — pulse a rule above the editor whenever the agent yields the turn",
+  "/ask-pulse hold <30m|0> — lock bright and stop animating after this long; 0 never locks",
   "/ask-pulse preview — mount the banner for a few seconds",
   "/ask-pulse reset — delete the user config",
 ].join("\n")
@@ -339,16 +378,28 @@ export default function askPulse(pi: ExtensionAPI) {
 
   let activeToolCallId: string | undefined
   let timer: Timer | undefined
+  let holdTimer: Timer | undefined
+  let mounted = false
   let tuiRef: TUI | undefined
 
-  const clear = (ctx: ExtensionContext): void => {
-    if (activeToolCallId === undefined && timer === undefined) return // idempotent
-    activeToolCallId = undefined
-    tuiRef = undefined
+  /** Stop the repaint tick and the hold deadline; the widget itself is left to the caller. */
+  const stopTimers = (ctx: ExtensionContext): void => {
     if (timer !== undefined) {
       ctx.clearTimer(timer)
       timer = undefined
     }
+    if (holdTimer !== undefined) {
+      ctx.clearTimer(holdTimer)
+      holdTimer = undefined
+    }
+  }
+
+  const clear = (ctx: ExtensionContext): void => {
+    if (!mounted) return // idempotent
+    mounted = false
+    activeToolCallId = undefined
+    tuiRef = undefined
+    stopTimers(ctx)
     try {
       ctx.ui.setWidget(WIDGET_KEY, undefined)
     } catch {
@@ -372,8 +423,23 @@ export default function askPulse(pi: ExtensionAPI) {
     } catch {
       return false // Component-factory widgets unsupported here; stay a silent no-op.
     }
+    mounted = true
     // The tick only asks for a repaint; the pulse phase comes from the wall clock in render().
     timer = ctx.setInterval(() => tuiRef?.requestRender(), FRAME_MS)
+
+    // Kill the tick once the banner locks bright: an unattended pane must not repaint at 10 Hz
+    // forever. `render()` re-derives the locked state from its own clock, so any later repaint
+    // still paints bright.
+    if (palette.holdAfterMs > 0) {
+      holdTimer = ctx.setTimeout(() => {
+        if (timer !== undefined) {
+          ctx.clearTimer(timer)
+          timer = undefined
+        }
+        holdTimer = undefined
+        tuiRef?.requestRender() // one final frame, now at full brightness
+      }, palette.holdAfterMs)
+    }
     return true
   }
 
@@ -421,7 +487,7 @@ export default function askPulse(pi: ExtensionAPI) {
             process.env.ASK_PULSE_COLOR !== undefined ? `env: ASK_PULSE_COLOR` : undefined,
           ].filter(Boolean)
           ctx.ui.notify(
-            `ask-pulse ${toHex(palette.bright)} → ${toHex(palette.dim)} @ ${palette.periodMs}ms, idle ${idle ? "on" : "off"}` +
+            `ask-pulse ${toHex(palette.bright)} → ${toHex(palette.dim)} @ ${palette.periodMs}ms, idle ${idle ? "on" : "off"}, hold ${palette.holdAfterMs > 0 ? `${palette.holdAfterMs}ms` : "never"}` +
               (origins.length > 0 ? ` (${origins.join(", ")})` : " (defaults)"),
           )
           return
@@ -434,6 +500,16 @@ export default function askPulse(pi: ExtensionAPI) {
           const enabled = value.toLowerCase() === "on"
           writeUserConfig({ idle: enabled })
           ctx.ui.notify(`ask-pulse idle → ${enabled ? "on" : "off"}`)
+          return
+        }
+        case "hold": {
+          const ms = parseDuration(value)
+          if (ms === undefined) {
+            ctx.ui.notify(`Usage: /ask-pulse hold <30m|90s|1800000|0> (got "${value}")`, "error")
+            return
+          }
+          writeUserConfig({ holdAfterMs: ms })
+          ctx.ui.notify(ms > 0 ? `ask-pulse holds bright after ${ms}ms` : "ask-pulse pulses indefinitely")
           return
         }
         case "color": {

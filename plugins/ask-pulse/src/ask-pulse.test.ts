@@ -1,7 +1,6 @@
 // Palette resolution and banner geometry. `AGENT_DIR` is resolved once at module init, so
 // `PI_CODING_AGENT_DIR` must be set before the module under test is imported — hence the
-// dynamic import below, which is also why this suite owns the env instead of a fixture.
-import { afterAll, beforeAll, describe, expect, test } from "bun:test"
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, type Mock, spyOn, test } from "bun:test"
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -16,7 +15,7 @@ delete process.env.ASK_PULSE_COLOR
 delete process.env.ASK_PULSE_PERIOD_MS
 
 // Dynamic: the module reads PI_CODING_AGENT_DIR at init, which the lines above must win.
-const { parseColor, deriveDim, loadConfig, AskPulseBanner } = await import("./ask-pulse.ts")
+const { parseColor, deriveDim, parseDuration, loadConfig, AskPulseBanner } = await import("./ask-pulse.ts")
 
 const hex = (color: readonly number[]) => `#${color.map((c) => c.toString(16).padStart(2, "0")).join("")}`
 const userConfig = join(agentDir, "ask-pulse.json")
@@ -51,6 +50,49 @@ test("deriveDim scales every channel to 24%", () => {
   expect(hex(deriveDim([0xff, 0x10, 0xf0]))).toBe("#3d043a")
 })
 
+describe("parseDuration", () => {
+  test("reads bare milliseconds and unit suffixes", () => {
+    expect(parseDuration("1800000")).toBe(1_800_000)
+    expect(parseDuration("30m")).toBe(1_800_000)
+    expect(parseDuration("90s")).toBe(90_000)
+    expect(parseDuration("2h")).toBe(7_200_000)
+    expect(parseDuration(" 250ms ")).toBe(250)
+    expect(parseDuration("1.5m")).toBe(90_000)
+  })
+
+  test("keeps 0 and negatives, which mean 'never lock'", () => {
+    expect(parseDuration("0")).toBe(0)
+    expect(parseDuration("-1")).toBe(-1)
+  })
+
+  test("rejects junk rather than silently meaning zero", () => {
+    for (const junk of ["", "soon", "30x", "m30", "3 0m"]) expect(parseDuration(junk)).toBeUndefined()
+  })
+})
+
+describe("loadConfig holdAfterMs", () => {
+  beforeAll(() => {
+    rmSync(userConfig, { force: true })
+    rmSync(projectConfig, { force: true })
+    delete process.env.ASK_PULSE_HOLD_AFTER_MS
+  })
+
+  test("defaults to 30 minutes", () => {
+    expect(loadConfig(projectDir).palette.holdAfterMs).toBe(1_800_000)
+  })
+
+  test("an empty environment variable does not mean 'lock instantly'", () => {
+    process.env.ASK_PULSE_HOLD_AFTER_MS = ""
+    expect(loadConfig(projectDir).palette.holdAfterMs).toBe(1_800_000)
+    delete process.env.ASK_PULSE_HOLD_AFTER_MS
+  })
+
+  test("takes 0 from a config file to disable the lock", () => {
+    writeFileSync(userConfig, JSON.stringify({ holdAfterMs: 0 }))
+    expect(loadConfig(projectDir).palette.holdAfterMs).toBe(0)
+    rmSync(userConfig, { force: true })
+  })
+})
 describe("loadConfig precedence", () => {
   beforeAll(() => {
     rmSync(userConfig, { force: true })
@@ -133,7 +175,7 @@ describe("AskPulseBanner.render", () => {
     horizontal: "─",
     vertical: "│",
   }
-  const palette = { dim: [0x3d, 0x04, 0x3a], bright: [0xff, 0x10, 0xf0], periodMs: 1200 } as const
+  const palette = { dim: [0x3d, 0x04, 0x3a], bright: [0xff, 0x10, 0xf0], periodMs: 1200, holdAfterMs: 0 } as const
   const banner = new AskPulseBanner(["Apply the migration?"], glyphs, palette)
   // ESC is assembled at runtime: a literal escape in a regex trips lint/suspicious/noControlCharactersInRegex.
   const ESC = String.fromCharCode(0x1b)
@@ -183,5 +225,53 @@ describe("AskPulseBanner.render", () => {
     expect(only).not.toContain(glyphs.topLeft)
     expect(only).not.toContain(glyphs.topRight)
     expect(only.startsWith(glyphs.horizontal)).toBe(true)
+  })
+
+  // The banner derives its phase from `Date.now()`, so the clock is the only input worth
+  // controlling here — no sleeps, and the assertions are exact rather than "roughly bright".
+  describe("hold window", () => {
+    // A whole number of 1200ms periods, so `now % periodMs` — which is what drives the phase,
+    // absolute wall clock rather than time-since-mount — is a known quantity in every sample.
+    const MOUNTED_AT = 1_000_800
+    let clock: Mock<() => number>
+
+    const mountAt = (holdAfterMs: number) => {
+      clock.mockReturnValue(MOUNTED_AT)
+      return new AskPulseBanner([], glyphs, { ...palette, holdAfterMs })
+    }
+    const tripletsAt = (banner: InstanceType<typeof AskPulseBanner>, now: number) => {
+      clock.mockReturnValue(now)
+      return [...(banner.render(40) as string[]).join("").matchAll(TRUECOLOR)].map((m) => m.slice(1).map(Number))
+    }
+
+    beforeEach(() => {
+      clock = spyOn(Date, "now")
+    })
+    afterEach(() => {
+      clock.mockRestore()
+    })
+
+    test("pins every channel to the bright endpoint once the window elapses", () => {
+      const banner = mountAt(60_000)
+      const triplets = tripletsAt(banner, MOUNTED_AT + 60_000)
+      expect(triplets.length).toBeGreaterThan(0)
+      for (const triplet of triplets) expect(triplet).toEqual([...palette.bright])
+    })
+
+    test("still interpolates one tick before the deadline", () => {
+      const banner = mountAt(60_000)
+      // 900ms into a 1200ms period: sin(3π/2) = -1, so the pulse is at its dim trough.
+      const [first] = tripletsAt(banner, MOUNTED_AT + 900)
+      expect(first).toEqual([...palette.dim])
+    })
+
+    test("never locks when holdAfterMs is zero or negative", () => {
+      for (const holdAfterMs of [0, -1]) {
+        const banner = mountAt(holdAfterMs)
+        // An hour later it must still track the wall clock rather than sit bright.
+        const [first] = tripletsAt(banner, MOUNTED_AT + 3_600_000 + 900)
+        expect(first).toEqual([...palette.dim])
+      }
+    })
   })
 })
