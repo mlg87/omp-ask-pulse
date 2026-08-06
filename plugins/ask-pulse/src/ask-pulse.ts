@@ -49,10 +49,13 @@ const PREVIEW_MS = 4000
 
 type RGB = readonly [number, number, number]
 
-/** Resolved pulse appearance: the interpolation endpoints, cycle length, and when to stop. */
+/**
+ * Resolved pulse appearance: the two interpolation endpoints, cycle length, and when to stop.
+ * The pulse fades `colorB` (phase 0) → `colorA` (phase 1); the hold lock pins at `colorA`.
+ */
 interface Palette {
-  dim: RGB
-  bright: RGB
+  colorB: RGB
+  colorA: RGB
   periodMs: number
   /**
    * Milliseconds of pulsing before the banner locks at full brightness and the repaint tick is
@@ -62,13 +65,15 @@ interface Palette {
   holdAfterMs: number
 }
 
-const DEFAULT_BRIGHT: RGB = [0xff, 0x10, 0xf0] // "dayglo pink"
+// v1.5: the pulse fades between two configurable colors; these are the omp-logo pink/cyan pair.
+const DEFAULT_COLOR_A: RGB = [0xff, 0x10, 0xf0] // "dayglo pink"
+const DEFAULT_COLOR_B: RGB = [0x0a, 0xf0, 0xff] // cyan
 const DEFAULT_PERIOD_MS = 1200 // ~0.83 Hz
 const DEFAULT_HOLD_AFTER_MS = 30 * 60 * 1000
 
 /** Named endpoints, so `/ask-pulse color pink` beats memorising a hex triplet. */
 const PRESETS: Readonly<Record<string, RGB>> = {
-  pink: DEFAULT_BRIGHT,
+  pink: DEFAULT_COLOR_A,
   green: [0x39, 0xff, 0x14],
   cyan: [0x0a, 0xf0, 0xff],
   amber: [0xff, 0xb0, 0x00],
@@ -77,8 +82,9 @@ const PRESETS: Readonly<Record<string, RGB>> = {
 }
 
 /**
- * The dim endpoint is derived, not configured, so a one-word color change stays one word. 0.24
- * keeps the trough visible on a dark terminal without competing with the theme's own borders.
+ * Fallback secondary endpoint: used when only one color is configured, so `/ask-pulse color green`
+ * alone still means "green pulsing against dim green" (the pre-v1.5 behavior). 0.24 keeps the
+ * trough visible on a dark terminal without competing with the theme's own borders.
  */
 export function deriveDim(bright: RGB): RGB {
   return [Math.round(bright[0] * 0.24), Math.round(bright[1] * 0.24), Math.round(bright[2] * 0.24)]
@@ -142,19 +148,27 @@ export function loadConfig(cwd: string): PulseConfig {
     readConfigFile(join(cwd, ".omp", CONFIG_BASENAME)),
     {
       color: process.env.ASK_PULSE_COLOR,
+      color2: process.env.ASK_PULSE_COLOR2,
       periodMs: process.env.ASK_PULSE_PERIOD_MS,
       idle: process.env.ASK_PULSE_IDLE,
       holdAfterMs: process.env.ASK_PULSE_HOLD_AFTER_MS,
     },
   ]
 
-  let bright = DEFAULT_BRIGHT
+  let colorA = DEFAULT_COLOR_A
+  let colorASet = false
+  let colorB: RGB | undefined // undefined = no source configured a secondary endpoint
   let periodMs = DEFAULT_PERIOD_MS
   let idle = true
   let holdAfterMs = DEFAULT_HOLD_AFTER_MS
   for (const source of sources) {
-    const color = parseColor(source.color)
-    if (color !== undefined) bright = color
+    const a = parseColor(source.color)
+    if (a !== undefined) {
+      colorA = a
+      colorASet = true
+    }
+    const b = parseColor(source.color2)
+    if (b !== undefined) colorB = b
     const period = Number(source.periodMs)
     if (Number.isFinite(period) && period >= 100) periodMs = period
     // Accept booleans from JSON and "0"/"false" from the environment, ignore anything else.
@@ -166,7 +180,9 @@ export function loadConfig(cwd: string): PulseConfig {
       if (Number.isFinite(hold)) holdAfterMs = hold
     }
   }
-  return { palette: { dim: deriveDim(bright), bright, periodMs, holdAfterMs }, idle }
+  // Only `color` set → keep the pre-v1.5 look (color ⇄ its own dim). Nothing set → the pink/cyan pair.
+  const resolvedB = colorB ?? (colorASet ? deriveDim(colorA) : DEFAULT_COLOR_B)
+  return { palette: { colorB: resolvedB, colorA, periodMs, holdAfterMs }, idle }
 }
 
 /** Persist a partial config to the user file, preserving unrelated keys. */
@@ -178,12 +194,12 @@ function writeUserConfig(patch: Record<string, unknown>): string {
   return USER_CONFIG_PATH
 }
 
-/** Linear per-channel interpolation, emitted as a truecolor SGR pair. */
+/** Linear per-channel interpolation between the two endpoints, emitted as a truecolor SGR pair. */
 function paint(text: string, t: number, palette: Palette): string {
-  const { dim, bright } = palette
-  const r = Math.round(dim[0] + (bright[0] - dim[0]) * t)
-  const g = Math.round(dim[1] + (bright[1] - dim[1]) * t)
-  const b = Math.round(dim[2] + (bright[2] - dim[2]) * t)
+  const { colorB, colorA } = palette
+  const r = Math.round(colorB[0] + (colorA[0] - colorB[0]) * t)
+  const g = Math.round(colorB[1] + (colorA[1] - colorB[1]) * t)
+  const b = Math.round(colorB[2] + (colorA[2] - colorB[2]) * t)
   return `\x1b[38;2;${r};${g};${b}m${text}\x1b[39m`
 }
 
@@ -347,7 +363,8 @@ export class AskPulseBanner implements Component {
     const lines: string[] = [top]
     for (const line of this.#body(innerWidth)) {
       const pad = Math.max(0, innerWidth - stringWidth(line))
-      // Title text stays readable: floor its brightness at the midpoint of the pulse.
+      // Title text stays readable: floor the phase at the midpoint so it biases toward `colorA`
+      // (and, for a dim-derived palette, keeps the old readability guarantee).
       lines.push(`${bar} ${paint(line, Math.max(0.5, t), palette)}${" ".repeat(pad)} ${bar}`)
     }
     lines.push(paint(`${bottomLeft}${horizontal.repeat(ruleWidth)}${bottomRight}`, t, palette))
@@ -365,7 +382,7 @@ export function parseDuration(raw: string): number | undefined {
 
 const USAGE = [
   "/ask-pulse show — print the active palette and where it came from",
-  "/ask-pulse color <hex|pink|green|cyan|amber|violet|red> — set the bright endpoint",
+  "/ask-pulse color <first> [second] — set the fade endpoints; one color pulses against its own dim",
   "/ask-pulse period <ms> — set the pulse cycle length (min 100)",
   "/ask-pulse idle <on|off> — pulse a rule above the editor whenever the agent yields the turn",
   "/ask-pulse hold <30m|0> — lock bright and stop animating after this long; 0 never locks",
@@ -485,9 +502,10 @@ export default function askPulse(pi: ExtensionAPI) {
             existsSync(USER_CONFIG_PATH) ? `user: ${USER_CONFIG_PATH}` : undefined,
             existsSync(projectPath) ? `project: ${projectPath}` : undefined,
             process.env.ASK_PULSE_COLOR !== undefined ? `env: ASK_PULSE_COLOR` : undefined,
+            process.env.ASK_PULSE_COLOR2 !== undefined ? `env: ASK_PULSE_COLOR2` : undefined,
           ].filter(Boolean)
           ctx.ui.notify(
-            `ask-pulse ${toHex(palette.bright)} → ${toHex(palette.dim)} @ ${palette.periodMs}ms, idle ${idle ? "on" : "off"}, hold ${palette.holdAfterMs > 0 ? `${palette.holdAfterMs}ms` : "never"}` +
+            `ask-pulse ${toHex(palette.colorA)} ⇄ ${toHex(palette.colorB)} @ ${palette.periodMs}ms, idle ${idle ? "on" : "off"}, hold ${palette.holdAfterMs > 0 ? `${palette.holdAfterMs}ms` : "never"}` +
               (origins.length > 0 ? ` (${origins.join(", ")})` : " (defaults)"),
           )
           return
@@ -513,16 +531,34 @@ export default function askPulse(pi: ExtensionAPI) {
           return
         }
         case "color": {
-          const color = parseColor(value)
-          if (color === undefined) {
+          if (rest.length === 0 || rest.length > 2) {
             ctx.ui.notify(
-              `Unrecognized color "${value}". Use a hex value or: ${Object.keys(PRESETS).join(", ")}`,
+              `Usage: /ask-pulse color <first> [second] — hex or preset (${Object.keys(PRESETS).join(" ")})`,
               "error",
             )
             return
           }
-          const path = writeUserConfig({ color: toHex(color) })
-          ctx.ui.notify(`ask-pulse color → ${toHex(color)} (${path})`)
+          const parsed: RGB[] = []
+          for (const token of rest) {
+            const color = parseColor(token)
+            if (color === undefined) {
+              ctx.ui.notify(
+                `Unrecognized color "${token}". Use a hex value or: ${Object.keys(PRESETS).join(", ")}`,
+                "error",
+              )
+              return
+            }
+            parsed.push(color)
+          }
+          const [first, second] = parsed as [RGB, RGB?]
+          // `writeUserConfig` deletes undefined keys, so a lone color clears `color2` and restores
+          // the dim-derived fallback rather than leaving a stale second endpoint behind.
+          const path = writeUserConfig({ color: toHex(first), color2: second && toHex(second) })
+          ctx.ui.notify(
+            second === undefined
+              ? `ask-pulse color → ${toHex(first)} (dim-derived pulse) (${path})`
+              : `ask-pulse colors → ${toHex(first)} ⇄ ${toHex(second)} (${path})`,
+          )
           return
         }
         case "period": {
@@ -538,14 +574,17 @@ export default function askPulse(pi: ExtensionAPI) {
         case "preview": {
           if (!ctx.hasUI) return
           clear(ctx)
-          if (!mount(ctx, [`Preview — ${toHex(palette.bright)} @ ${palette.periodMs}ms`], palette)) return
+          const label = `Preview — ${toHex(palette.colorA)} ⇄ ${toHex(palette.colorB)} @ ${palette.periodMs}ms`
+          if (!mount(ctx, [label], palette)) return
           // No real ask is in flight, so nothing else will tear this down.
           ctx.setTimeout(() => clear(ctx), PREVIEW_MS)
           return
         }
         case "reset": {
           if (existsSync(USER_CONFIG_PATH)) rmSync(USER_CONFIG_PATH)
-          ctx.ui.notify(`ask-pulse reset to ${toHex(DEFAULT_BRIGHT)} @ ${DEFAULT_PERIOD_MS}ms`)
+          ctx.ui.notify(
+            `ask-pulse reset to ${toHex(DEFAULT_COLOR_A)} ⇄ ${toHex(DEFAULT_COLOR_B)} @ ${DEFAULT_PERIOD_MS}ms`,
+          )
           return
         }
         default:

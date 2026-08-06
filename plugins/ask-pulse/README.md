@@ -44,39 +44,41 @@ overwrites. Use the slash command:
 
 ```
 /ask-pulse show                 print the active palette and where it came from
-/ask-pulse color pink           preset: pink green cyan amber violet red
-/ask-pulse color #39ff14        or any #rgb / #rrggbb hex
+/ask-pulse color pink cyan      fade between two colors (presets: pink green cyan amber violet red)
+/ask-pulse color #39ff14        one color pulses against its own 24%-brightness dim
 /ask-pulse period 800           pulse cycle in ms (min 100)
 /ask-pulse idle off             stop pulsing on plain end-of-turn (ask still pulses)
-/ask-pulse hold 30m             lock bright after this long; 0 pulses forever
+/ask-pulse hold 30m             lock at the first color after this long; 0 pulses forever
 /ask-pulse preview              mount the banner for four seconds
 /ask-pulse reset                delete the user config
 ```
 
-`color`, `period`, and `idle` persist to `~/.omp/agent/ask-pulse.json`. Precedence, lowest to
+`color`, `color2`, `period`, and `idle` persist to `~/.omp/agent/ask-pulse.json`. Precedence, lowest to
 highest:
 
 | Source | Example |
 |---|---|
-| built-in default | dayglo pink `#ff10f0` @ 1200 ms |
+| built-in default | pink `#ff10f0` ⇄ cyan `#0af0ff` @ 1200 ms |
 | user config | `~/.omp/agent/ask-pulse.json` |
 | project config | `<project>/.omp/ask-pulse.json` |
-| environment | `ASK_PULSE_COLOR=#0af0ff ASK_PULSE_PERIOD_MS=800 ASK_PULSE_IDLE=0 ASK_PULSE_HOLD_AFTER_MS=0` |
+| environment | `ASK_PULSE_COLOR=#ff10f0 ASK_PULSE_COLOR2=#0af0ff ASK_PULSE_PERIOD_MS=800 ASK_PULSE_IDLE=0 ASK_PULSE_HOLD_AFTER_MS=0` |
 
 ```json
-{ "color": "#ff10f0", "periodMs": 1200, "idle": true, "holdAfterMs": 1800000 }
+{ "color": "#ff10f0", "color2": "#0af0ff", "periodMs": 1200, "idle": true, "holdAfterMs": 1800000 }
 ```
 
 The config is re-read on every mount, so a change lands on the next turn — no restart.
 
-After `holdAfterMs` (default 30 minutes) the banner stops animating and locks at full
-brightness, and the repaint tick is killed — an unattended pane must not repaint at 10 Hz
+After `holdAfterMs` (default 30 minutes) the banner stops animating and locks at `color`, and
+the repaint tick is killed — an unattended pane must not repaint at 10 Hz
 overnight. The locked state is just as visible as the pulse once you look at the screen.
 The deadline is re-derived inside `render()`, so a resize or re-layout after the tick dies
 still paints bright. `0` or negative disables the lock.
 
-Only the bright endpoint is configurable; the trough is derived from it at 24% brightness,
-so one word recolors the whole banner. A malformed config is ignored rather than fatal.
+The pulse fades between two endpoints: `color` at the peak and `color2` at the trough (v1.5).
+Set only `color` and the trough is derived from it at 24% brightness, so one word still
+recolors the whole banner and pre-v1.5 single-color configs keep their look. A malformed
+config is ignored rather than fatal.
 
 Compile-time knobs still living in `src/ask-pulse.ts`: `FRAME_MS` (repaint tick),
 `MAX_QUESTIONS`, `MAX_LINES_PER_QUESTION`.

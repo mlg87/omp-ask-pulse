@@ -15,17 +15,17 @@
 </style>
 <div id="term"></div>
 <script>
-  // Mirrors the render math in ../src/ask-pulse.ts. Keep DIM/DAYGLO/PULSE_PERIOD_MS/TITLE in
+  // Mirrors the render math in ../src/ask-pulse.ts. Keep COLOR_A/COLOR_B/PULSE_PERIOD_MS/TITLE in
   // sync with the extension so the published preview never drifts from the real banner.
-  const DIM = [0x3d, 0x0a, 0x33];
-  const DAYGLO = [0xff, 0x10, 0xf0];
+  const COLOR_B = [0x0a, 0xf0, 0xff];
+  const COLOR_A = [0xff, 0x10, 0xf0];
   const PULSE_PERIOD_MS = 1200;
   const TITLE = " WAITING FOR YOUR INPUT ";
   const WIDTH = 76;
   const G = { topLeft: "\u256d", topRight: "\u256e", bottomLeft: "\u2570", bottomRight: "\u256f", horizontal: "\u2500", vertical: "\u2502" };
   const QUESTIONS = ["[Deploy] Apply the pending migration to production?"];
 
-  const mix = (t) => DIM.map((c, i) => Math.round(c + (DAYGLO[i] - c) * t));
+  const mix = (t) => COLOR_B.map((c, i) => Math.round(c + (COLOR_A[i] - c) * t));
   const css = (t) => `rgb(${mix(t).join(",")})`;
   const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;");
   const span = (s, t) => `<span style="color:${css(t)}">${esc(s)}</span>`;
