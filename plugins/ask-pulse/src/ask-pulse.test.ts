@@ -1,7 +1,7 @@
 // Palette resolution and banner geometry. `AGENT_DIR` is resolved once at module init, so
 // `PI_CODING_AGENT_DIR` must be set before the module under test is imported — hence the
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, type Mock, spyOn, test } from "bun:test"
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -16,7 +16,7 @@ delete process.env.ASK_PULSE_COLOR2
 delete process.env.ASK_PULSE_PERIOD_MS
 
 // Dynamic: the module reads PI_CODING_AGENT_DIR at init, which the lines above must win.
-const { parseColor, deriveDim, parseDuration, loadConfig, AskPulseBanner } = await import("./ask-pulse.ts")
+const { parseColor, deriveDim, parseDuration, loadConfig, AskPulseBanner, mixColors } = await import("./ask-pulse.ts")
 
 const hex = (color: readonly number[]) => `#${color.map((c) => c.toString(16).padStart(2, "0")).join("")}`
 const userConfig = join(agentDir, "ask-pulse.json")
@@ -104,7 +104,7 @@ describe("loadConfig precedence", () => {
     const palette = loadConfig(projectDir).palette
     expect(hex(palette.colorA)).toBe("#ff10f0")
     expect(hex(palette.colorB)).toBe("#0af0ff")
-    expect(palette.periodMs).toBe(1200)
+    expect(palette.periodMs).toBe(2000) // v1.6 slowed the default cycle for a smoother fade
   })
 
   test("user config beats the default, and a lone color pulses against its own dim", () => {
@@ -215,23 +215,47 @@ describe("AskPulseBanner.render", () => {
     expect(plain(lines[0] as string)).toContain("WAITING FOR YOUR INPUT")
   })
 
-  test("emits only colors on the colorB→colorA segment", () => {
-    const lines = (banner.render(40) as string[]).join("")
-    const triplets = [...lines.matchAll(TRUECOLOR)].map((m) => m.slice(1).map(Number))
-    expect(triplets.length).toBeGreaterThan(0)
-    for (const [r, g, b] of triplets as number[][]) {
-      const t = ((r as number) - palette.colorB[0]) / (palette.colorA[0] - palette.colorB[0])
-      expect(t).toBeGreaterThanOrEqual(-0.01)
-      expect(t).toBeLessThanOrEqual(1.01)
-      // ±1, not ±0.5: `t` is recovered from an already-rounded red channel, so its own ±0.5
-      // rounding error propagates into the predicted green/blue on top of their own rounding.
-      expect(
-        Math.abs((g as number) - (palette.colorB[1] + (palette.colorA[1] - palette.colorB[1]) * t)),
-      ).toBeLessThanOrEqual(1)
-      expect(
-        Math.abs((b as number) - (palette.colorB[2] + (palette.colorA[2] - palette.colorB[2]) * t)),
-      ).toBeLessThanOrEqual(1)
+  // v1.6 mixes in OKLab, so intermediate colors are no longer predictable by an RGB-linear formula.
+  // The contract worth pinning is instead the phase→endpoint mapping, which is exact.
+  describe("exact phase colors", () => {
+    // A whole number of 1200ms periods: `pulsePhase` reads the absolute wall clock, so only
+    // `now % periodMs` matters and every sample below is a known point on the sine.
+    const BASE = 1_200_000
+    let clock: Mock<() => number>
+
+    beforeEach(() => {
+      clock = spyOn(Date, "now")
+    })
+    afterEach(() => {
+      clock.mockRestore()
+    })
+
+    const tripletsAt = (now: number) => {
+      clock.mockReturnValue(now)
+      return [...(banner.render(40) as string[]).join("").matchAll(TRUECOLOR)].map((m) => m.slice(1).map(Number))
     }
+
+    test("sits exactly on colorB at the trough", () => {
+      // 900/1200 of a period: sin(3π/2) = -1 → t = 0. Only the border is asserted: body text keeps
+      // the 0.5 readability floor, so it never reaches the colorB endpoint.
+      const [border] = tripletsAt(BASE + 900)
+      expect(border).toEqual([...palette.colorB])
+    })
+
+    test("sits exactly on colorA at the peak", () => {
+      // 300/1200: sin(π/2) = +1 → t = 1, above the body's floor, so every run is the endpoint.
+      const triplets = tripletsAt(BASE + 300)
+      expect(triplets.length).toBeGreaterThan(0)
+      for (const triplet of triplets) expect(triplet).toEqual([...palette.colorA])
+    })
+
+    test("uses the OKLab midpoint at the zero crossing", () => {
+      // sin(0) = 0 → t = 0.5, which is also exactly the body's readability floor.
+      const triplets = tripletsAt(BASE)
+      const mid = [...mixColors(palette.colorB, palette.colorA, 0.5)]
+      expect(triplets.length).toBeGreaterThan(0)
+      for (const triplet of triplets) expect(triplet).toEqual(mid)
+    })
   })
 
   test("degrades to a single line instead of throwing on a hostile width", () => {
@@ -245,17 +269,66 @@ describe("AskPulseBanner.render", () => {
     expect(plain(lines[3] as string)).toContain("…")
   })
 
-  test("collapses to one full-width titled rule when there are no questions", () => {
+  test("collapses to one full-width caret rule when there are no questions", () => {
     const idle = new AskPulseBanner([], glyphs, palette)
     const lines = idle.render(40) as string[]
     expect(lines).toHaveLength(1)
     const only = plain(lines[0] as string)
     expect(Bun.stringWidth(only)).toBe(40)
     expect(only).toContain("WAITING FOR YOUR INPUT")
-    // A rule, not a box: no corner glyphs anywhere on the line.
+    // v1.6: carets, not a box and not the theme's horizontal rule glyph.
     expect(only).not.toContain(glyphs.topLeft)
     expect(only).not.toContain(glyphs.topRight)
-    expect(only.startsWith(glyphs.horizontal)).toBe(true)
+    expect(only).not.toContain(glyphs.horizontal)
+    expect(only).toMatch(/^[<>]+ WAITING FOR YOUR INPUT [<>]+$/)
+  })
+
+  // Width 40 with a 24-column title gives 8 carets per side, so every `q` below is exact.
+  describe("idle caret wave", () => {
+    const BASE = 1_200_000
+    let clock: Mock<() => number>
+
+    beforeEach(() => {
+      clock = spyOn(Date, "now")
+    })
+    afterEach(() => {
+      clock.mockRestore()
+    })
+
+    const idleAt = (now: number, holdAfterMs = 0) => {
+      clock.mockReturnValue(BASE)
+      const idle = new AskPulseBanner([], glyphs, { ...palette, holdAfterMs })
+      clock.mockReturnValue(now)
+      const line = (idle.render(40) as string[])[0] as string
+      return { text: plain(line), triplets: [...line.matchAll(TRUECOLOR)].map((m) => m.slice(1).map(Number)) }
+    }
+
+    test("sweeps every caret and flips it at the inward turnaround", () => {
+      // Half a period: the front has cleared the innermost caret, so the whole line is swept.
+      const { text, triplets } = idleAt(BASE + 600)
+      expect(text).toBe(`${"<".repeat(8)} WAITING FOR YOUR INPUT ${">".repeat(8)}`)
+      expect(triplets.length).toBeGreaterThan(0)
+      for (const triplet of triplets) expect(triplet).toEqual([...palette.colorA])
+    })
+
+    test("rests unswept and inward-pointing at the outward turnaround", () => {
+      const { text, triplets } = idleAt(BASE)
+      expect(text).toBe(`${">".repeat(8)} WAITING FOR YOUR INPUT ${"<".repeat(8)}`)
+      expect(triplets.length).toBeGreaterThan(0)
+      for (const triplet of triplets) expect(triplet).toEqual([...palette.colorB])
+    })
+
+    test("emits one SGR run per color, not one per glyph", () => {
+      // At rest the line is uniformly colorB; 40 separate SGR pairs would be a 40x waste per frame.
+      expect(idleAt(BASE).triplets).toHaveLength(1)
+    })
+
+    test("locks fully swept but unflipped once the hold window elapses", () => {
+      const { text, triplets } = idleAt(BASE + 60_000, 60_000)
+      expect(text).toMatch(/^>+ WAITING FOR YOUR INPUT <+$/)
+      expect(triplets.length).toBeGreaterThan(0)
+      for (const triplet of triplets) expect(triplet).toEqual([...palette.colorA])
+    })
   })
 
   // The banner derives its phase from `Date.now()`, so the clock is the only input worth
@@ -266,9 +339,11 @@ describe("AskPulseBanner.render", () => {
     const MOUNTED_AT = 1_000_800
     let clock: Mock<() => number>
 
+    // A question, so this block exercises the uniform-phase box path: idle mode is per-column after
+    // v1.6 and its own lock behavior is covered in "idle caret wave".
     const mountAt = (holdAfterMs: number) => {
       clock.mockReturnValue(MOUNTED_AT)
-      return new AskPulseBanner([], glyphs, { ...palette, holdAfterMs })
+      return new AskPulseBanner(["q"], glyphs, { ...palette, holdAfterMs })
     }
     const tripletsAt = (banner: InstanceType<typeof AskPulseBanner>, now: number) => {
       clock.mockReturnValue(now)
@@ -304,5 +379,28 @@ describe("AskPulseBanner.render", () => {
         expect(first).toEqual([...palette.colorB])
       }
     })
+  })
+})
+
+// WHY this is a test and not a release checklist item: omp's startup auto-update compares the
+// `version` field of the *catalog* entry, not package.json. A release that bumps the package but
+// forgets a catalog never reaches anyone's next session — silently. Fail the build instead.
+describe("release version sync", () => {
+  const pluginRoot = join(import.meta.dir, "..")
+  const repoRoot = join(pluginRoot, "..", "..")
+  const catalogs = [
+    join(repoRoot, ".omp-plugin", "marketplace.json"), // read by omp
+    join(repoRoot, ".claude-plugin", "marketplace.json"), // read by Claude Code
+  ]
+
+  // Skipped when the plugin directory is vendored without the marketplace repo around it.
+  test.skipIf(!catalogs.every((path) => existsSync(path)))("catalogs declare the package version", () => {
+    const version = JSON.parse(readFileSync(join(pluginRoot, "package.json"), "utf8")).version
+    expect(version).toMatch(/^\d+\.\d+\.\d+$/)
+    for (const path of catalogs) {
+      const catalog = JSON.parse(readFileSync(path, "utf8"))
+      expect(catalog.plugins[0].version).toBe(version)
+      expect(catalog.metadata.version).toBe(version)
+    }
   })
 })

@@ -11,6 +11,10 @@ An [omp](https://github.com/oh-my-pi/pi-coding-agent) plugin marketplace.
 |---|---|
 | [`ask-pulse`](plugins/ask-pulse) | Pulsing dayglo banner above the `ask` dialog so a waiting agent is impossible to miss. |
 
+![ask-pulse ask dialog banner](plugins/ask-pulse/docs/ask-pulse.gif)
+
+![ask-pulse idle caret wave](plugins/ask-pulse/docs/idle-wave.gif)
+
 Install one:
 
 ```

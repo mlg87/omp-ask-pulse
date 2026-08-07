@@ -1,2 +1,4 @@
 node_modules/
 *.log
+# Per-frame HTML emitted by plugins/ask-pulse/scripts/render-preview.ts; only the GIFs are committed.
+preview-*.html
