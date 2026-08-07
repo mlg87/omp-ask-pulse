@@ -41,13 +41,20 @@ const WIDGET_KEY = "ask-pulse"
 const TITLE = " WAITING FOR YOUR INPUT "
 const CONFIG_BASENAME = "ask-pulse.json"
 
-const FRAME_MS = 100 // render tick; phase is derived from wall clock, not from tick count
+// v1.6: 33ms (~30 fps) instead of 100ms. Perceptual mixing alone removes most of the banding, but
+// a 10 fps step is visible as stutter on a slow fade, so the tick and the mixing were fixed together.
+const FRAME_MS = 33 // render tick; phase is derived from wall clock, not from tick count
+/**
+ * Half-width of the caret wave's blend band, as a fraction of a segment (v1.6 idle mode). Wider =
+ * a longer color gradient trailing the front; narrower = a hard edge that reads as a jump at 30 fps.
+ */
+const WAVE_SOFTNESS = 0.18
 const MAX_QUESTIONS = 3
 const MAX_LINES_PER_QUESTION = 3
 const MIN_WIDTH = 8
 const PREVIEW_MS = 4000
 
-type RGB = readonly [number, number, number]
+export type RGB = readonly [number, number, number]
 
 /**
  * Resolved pulse appearance: the two interpolation endpoints, cycle length, and when to stop.
@@ -59,7 +66,7 @@ interface Palette {
   periodMs: number
   /**
    * Milliseconds of pulsing before the banner locks at full brightness and the repaint tick is
-   * killed. An unattended pane would otherwise repaint at 10 Hz indefinitely; the locked bright
+   * killed. An unattended pane would otherwise repaint at ~30 Hz indefinitely; the locked bright
    * state is just as visible as the pulse once you finally look at the screen. `<= 0` never locks.
    */
   holdAfterMs: number
@@ -68,7 +75,9 @@ interface Palette {
 // v1.5: the pulse fades between two configurable colors; these are the omp-logo pink/cyan pair.
 const DEFAULT_COLOR_A: RGB = [0xff, 0x10, 0xf0] // "dayglo pink"
 const DEFAULT_COLOR_B: RGB = [0x0a, 0xf0, 0xff] // cyan
-const DEFAULT_PERIOD_MS = 1200 // ~0.83 Hz
+// v1.6: 2000ms, up from 1200ms. A slower cycle is what makes the fade read as smooth rather than
+// as a throb; the user explicitly allowed trading speed for smoothness.
+const DEFAULT_PERIOD_MS = 2000 // 0.5 Hz
 const DEFAULT_HOLD_AFTER_MS = 30 * 60 * 1000
 
 /** Named endpoints, so `/ask-pulse color pink` beats memorising a hex triplet. */
@@ -194,13 +203,108 @@ function writeUserConfig(patch: Record<string, unknown>): string {
   return USER_CONFIG_PATH
 }
 
-/** Linear per-channel interpolation between the two endpoints, emitted as a truecolor SGR pair. */
+/** sRGB channel (0–255) → linear-light [0,1]. */
+function toLinear(channel: number): number {
+  const x = channel / 255
+  return x <= 0.04045 ? x / 12.92 : ((x + 0.055) / 1.055) ** 2.4
+}
+
+/** Linear-light [0,1] → sRGB channel (0–255), clamped. */
+function toSrgb(value: number): number {
+  const x = value <= 0.0031308 ? 12.92 * value : 1.055 * value ** (1 / 2.4) - 0.055
+  return Math.round(Math.min(1, Math.max(0, x)) * 255)
+}
+
+/**
+ * Perceptual mix: `t=0` → `from`, `t=1` → `to`, interpolated in OKLab.
+ *
+ * WHY not a per-channel RGB lerp (what v1.5 did): the default pink→cyan path passes through
+ * desaturated gray at the midpoint, so the fade visibly dips to mud instead of staying dayglo.
+ * OKLab is perceptually uniform, so the midpoint stays saturated and the ramp reads as even.
+ * Matrices are Björn Ottosson's standard sRGB↔OKLab pair.
+ *
+ * Endpoints short-circuit so the roundtrip's rounding can never perturb them — callers and tests
+ * rely on `t=0`/`t=1` being byte-exact palette colors.
+ */
+export function mixColors(from: RGB, to: RGB, t: number): RGB {
+  if (t <= 0) return from
+  if (t >= 1) return to
+
+  const lab = (color: RGB): [number, number, number] => {
+    const r = toLinear(color[0])
+    const g = toLinear(color[1])
+    const b = toLinear(color[2])
+    const l = Math.cbrt(0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b)
+    const m = Math.cbrt(0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b)
+    const s = Math.cbrt(0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b)
+    return [
+      0.2104542553 * l + 0.793617785 * m - 0.0040720468 * s,
+      1.9779984951 * l - 2.428592205 * m + 0.4505937099 * s,
+      0.0259040371 * l + 0.7827717662 * m - 0.808675766 * s,
+    ]
+  }
+
+  const [l0, a0, b0] = lab(from)
+  const [l1, a1, b1] = lab(to)
+  const L = l0 + (l1 - l0) * t
+  const A = a0 + (a1 - a0) * t
+  const B = b0 + (b1 - b0) * t
+
+  const l = (L + 0.3963377774 * A + 0.2158037573 * B) ** 3
+  const m = (L - 0.1055613458 * A - 0.0638541728 * B) ** 3
+  const s = (L - 0.0894841775 * A - 1.291485548 * B) ** 3
+  return [
+    toSrgb(4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s),
+    toSrgb(-1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s),
+    toSrgb(-0.0041960863 * l - 0.7034186147 * m + 1.707614701 * s),
+  ]
+}
+
+/** Truecolor SGR wrapper — the single place the escape sequence shape is spelled out. */
+function sgr(color: RGB, text: string): string {
+  return `\x1b[38;2;${color[0]};${color[1]};${color[2]}m${text}\x1b[39m`
+}
+
+/** Perceptual interpolation between the two endpoints, emitted as a truecolor SGR pair. */
 function paint(text: string, t: number, palette: Palette): string {
-  const { colorB, colorA } = palette
-  const r = Math.round(colorB[0] + (colorA[0] - colorB[0]) * t)
-  const g = Math.round(colorB[1] + (colorA[1] - colorB[1]) * t)
-  const b = Math.round(colorB[2] + (colorA[2] - colorB[2]) * t)
-  return `\x1b[38;2;${r};${g};${b}m${text}\x1b[39m`
+  return sgr(mixColors(palette.colorB, palette.colorA, t), text)
+}
+
+/** One column of the idle caret wave: the glyph to draw and its position on the colorB→colorA ramp. */
+interface WaveCell {
+  glyph: string
+  t: number
+}
+
+/**
+ * Color ramp and flip state for the caret `i` steps in from its segment's *outer* edge (v1.6).
+ *
+ * The wave front `f` advances in the same normalised space as `q`, so a caret behind the front is
+ * fully `colorA`, one ahead of it fully `colorB`, and the {@link WAVE_SOFTNESS} band between them
+ * is smoothstepped — a linear band leaves a visible crease at the front on a dark terminal. The
+ * glyph flips at the band's midpoint, which is where the color visibly changes over.
+ */
+function waveCell(i: number, n: number, f: number, normal: string, flipped: string): WaveCell {
+  const q = (i + 0.5) / n
+  const raw = Math.min(1, Math.max(0, (f - q + WAVE_SOFTNESS) / (2 * WAVE_SOFTNESS)))
+  return { glyph: raw >= 0.5 ? flipped : normal, t: raw * raw * (3 - 2 * raw) }
+}
+
+/** Concatenate cells, emitting one SGR pair per maximal same-color run rather than per glyph. */
+function paintCells(cells: readonly WaveCell[], palette: Palette): string {
+  let out = ""
+  let run = ""
+  let runColor: RGB = [-1, -1, -1]
+  for (const { glyph, t } of cells) {
+    const color = mixColors(palette.colorB, palette.colorA, t)
+    if (color[0] !== runColor[0] || color[1] !== runColor[1] || color[2] !== runColor[2]) {
+      if (run !== "") out += sgr(runColor, run)
+      run = ""
+      runColor = color
+    }
+    run += glyph
+  }
+  return run === "" ? out : out + sgr(runColor, run)
 }
 
 /** Sine pulse in [0, 1] derived from wall-clock time so frames stay smooth regardless of tick jitter. */
@@ -295,14 +399,17 @@ export class AskPulseBanner implements Component {
   }
 
   /**
-   * Phase for this frame, or a hard 1 once the hold window has elapsed. The deadline is checked
-   * here rather than only in the extension's timer so a later repaint — a resize, a re-layout —
-   * still paints the locked bright state after the tick has been killed.
+   * Whether the hold window has elapsed. Checked here rather than only in the extension's timer so
+   * a later repaint — a resize, a re-layout — still paints the locked state after the tick is dead.
    */
+  #locked(): boolean {
+    const { holdAfterMs } = this.#palette
+    return holdAfterMs > 0 && Date.now() - this.#mountedAt >= holdAfterMs
+  }
+
+  /** Box-mode phase for this frame, or a hard 1 once the hold window has elapsed. */
   #phase(): number {
-    const { holdAfterMs, periodMs } = this.#palette
-    if (holdAfterMs > 0 && Date.now() - this.#mountedAt >= holdAfterMs) return 1
-    return pulsePhase(periodMs)
+    return this.#locked() ? 1 : pulsePhase(this.#palette.periodMs)
   }
 
   invalidate(): void {
@@ -333,14 +440,29 @@ export class AskPulseBanner implements Component {
     if (width < MIN_WIDTH) return [paint(TITLE.trim(), this.#phase(), palette)]
 
     // Idle mode: no questions to show, so the banner collapses to a single titled rule that sits
-    // directly above the editor without competing with the response text it follows.
+    // directly above the editor without competing with the response text it follows. v1.6 replaces
+    // the uniform horizontal rule with caret runs that a color wave sweeps inward from both edges
+    // to the text and back out again, each caret flipping to point *with* the wave as it passes.
     if (this.#questions.length === 0) {
-      const t = this.#phase()
       const titleWidth = Math.min(stringWidth(TITLE), width)
       const left = Math.max(0, Math.floor((width - titleWidth) / 2))
       const right = Math.max(0, width - titleWidth - left)
-      const { horizontal } = this.#glyphs
-      return [paint(`${horizontal.repeat(left)}${TITLE.slice(0, titleWidth)}${horizontal.repeat(right)}`, t, palette)]
+      const locked = this.#locked()
+      // Cosine ping-pong: the front runs edges→text over the first half period and back over the
+      // second, with zero velocity at both turnarounds so the bounce reads as a bounce, not a snap.
+      // The range overshoots [0, 1] by one softness half-width at each end so the extremes are
+      // fully swept / fully reset instead of frozen mid-blend. Locked: front parked past the text.
+      const u = (Date.now() % this.#palette.periodMs) / this.#palette.periodMs
+      const f = locked ? 1 : -WAVE_SOFTNESS + (1 + 2 * WAVE_SOFTNESS) * ((1 - Math.cos(2 * Math.PI * u)) / 2)
+      const cells: WaveCell[] = []
+      // Locked carets stay unflipped — pointing inward at the text is the resting attention state.
+      for (let i = 0; i < left; i++) cells.push(locked ? { glyph: ">", t: 1 } : waveCell(i, left, f, ">", "<"))
+      for (const glyph of TITLE.slice(0, titleWidth)) cells.push({ glyph, t: f })
+      // The right segment mirrors: its outer edge is the *last* column, so `i` counts back from it.
+      for (let k = 0; k < right; k++) {
+        cells.push(locked ? { glyph: "<", t: 1 } : waveCell(right - 1 - k, right, f, "<", ">"))
+      }
+      return [paintCells(cells, palette)]
     }
 
     const t = this.#phase()
@@ -444,7 +566,7 @@ export default function askPulse(pi: ExtensionAPI) {
     // The tick only asks for a repaint; the pulse phase comes from the wall clock in render().
     timer = ctx.setInterval(() => tuiRef?.requestRender(), FRAME_MS)
 
-    // Kill the tick once the banner locks bright: an unattended pane must not repaint at 10 Hz
+    // Kill the tick once the banner locks bright: an unattended pane must not repaint at ~30 Hz
     // forever. `render()` re-derives the locked state from its own clock, so any later repaint
     // still paints bright.
     if (palette.holdAfterMs > 0) {

@@ -1,6 +1,6 @@
 {
   "name": "omp-ask-pulse",
-  "version": "1.5.0",
+  "version": "1.6.0",
   "description": "Pulsing dayglo banner for a waiting omp agent: a rule on every yielded turn, a boxed banner during ask.",
   "license": "MIT",
   "omp": {
@@ -15,8 +15,8 @@
     "bun-types": "^1.3.14"
   },
   "scripts": {
-    "lint": "biome check src",
-    "format": "biome check --write src",
+    "lint": "biome check src scripts",
+    "format": "biome check --write src scripts",
     "typecheck": "tsc -p .",
     "test": "bun test src"
   }
