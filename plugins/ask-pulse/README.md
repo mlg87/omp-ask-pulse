@@ -1,25 +1,32 @@
 # ask-pulse
 
-A pulsing dayglo banner for a waiting agent, mounted directly above the editor so it is the
-last thing on screen — impossible to miss in a wall of terminal panes.
+A pulsing dayglo banner for a waiting agent, framing the whole screen so it is impossible to miss
+in a wall of terminal panes.
 
-Two modes, both pinned below all transcript output:
+Two modes, both pinned below all transcript output, plus a caret frame around the whole screen:
 
 - **ask** — a rounded box carrying the questions, for the whole life of an `ask` dialog.
 - **idle** — a caret rule (`>>> WAITING FOR YOUR INPUT <<<`) whenever the agent yields the turn at
-  all, including a plain prose answer that never called `ask`. A color wave sweeps inward from both
-  edges to the text and back out, and each caret flips to point with the wave as it passes.
-  Cleared the moment you submit.
+  all, including a plain prose answer that never called `ask`. Cleared the moment you submit.
+- **frame** (v1.7) — a caret strip across the top row and full-height down both side columns,
+  continuous with the rule above the editor, so the *whole* screen reads as "waiting", not just
+  the line above the prompt.
+
+By default all three flow a rainbow hue along the frame toward the text (v1.7); `/ask-pulse color
+<a> [b]` switches back to the pre-v1.7 two-color fade-and-bounce.
 
 Wrapping the assistant's actual response text is not possible from an extension:
-`registerMessageRenderer` only accepts custom message types, and decorating real transcript
-blocks would mean patching `AssistantMessageComponent` — see below for why that is refused.
+`registerMessageRenderer` only accepts custom message types, decorating real transcript blocks
+would mean patching `AssistantMessageComponent`, and omp rejects a direct `setTheme(ThemeObject)`
+call from an extension — see below for why all three are refused.
 
 ![ask-pulse in action](docs/ask-pulse.gif)
 
 ![idle caret wave](docs/idle-wave.gif)
 
-<sub>Both previews are captured from the real component via `scripts/render-preview.ts`, so they cannot drift from what the extension renders.</sub>
+![rainbow frame](docs/rainbow-frame.gif)
+
+<sub>All previews are captured from the real components via `scripts/render-preview.ts`, so they cannot drift from what the extension renders.</sub>
 
 ## Why an extension, not a patch
 
@@ -28,7 +35,13 @@ and `AskDialogComponent` is not exported from the public component barrel — th
 seam to animate it from outside. Patching the installed package would be erased by omp's
 several releases per day. So this mounts an *adjacent* animated banner through the stable
 extension API (`pi.setWidget(..., { placement: "aboveEditor" })`), which renders immediately
-above the editor container the dialog lives in.
+above the editor container the dialog lives in, plus three overlay strips
+(`TUI.showOverlay`) framing the top row and both side columns.
+
+Fading the transcript text itself (every line the agent already printed) is not reachable from an
+extension at all: `setTheme(ThemeObject)` is rejected ("Direct theme object not supported"),
+`setHeader`/`setFooter` are no-ops, and the components that paint transcript text have no external
+seam. The overlay frame is the closest attention-grabbing effect the documented surface allows.
 
 ## Install
 
@@ -57,9 +70,10 @@ overwrites. Use the slash command:
 /ask-pulse show                 print the active palette and where it came from
 /ask-pulse color pink cyan      fade between two colors (presets: pink green cyan amber violet red)
 /ask-pulse color #39ff14        one color pulses against its own 24%-brightness dim
-/ask-pulse period 800           pulse cycle in ms (min 100)
+/ask-pulse color rainbow        flow a rainbow along the frame toward the text (default)
+/ask-pulse period 800           pulse/flow cycle in ms (min 100)
 /ask-pulse idle off             stop pulsing on plain end-of-turn (ask still pulses)
-/ask-pulse hold 30m             lock at the first color after this long; 0 pulses forever
+/ask-pulse hold 30m             lock at the first color/hue after this long; 0 pulses forever
 /ask-pulse preview              mount the banner for four seconds
 /ask-pulse reset                delete the user config
 ```
@@ -69,14 +83,18 @@ highest:
 
 | Source | Example |
 |---|---|
-| built-in default | pink `#ff10f0` ⇄ cyan `#0af0ff` @ 2000 ms |
+| built-in default | rainbow @ 2000 ms |
 | user config | `~/.omp/agent/ask-pulse.json` |
 | project config | `<project>/.omp/ask-pulse.json` |
 | environment | `ASK_PULSE_COLOR=#ff10f0 ASK_PULSE_COLOR2=#0af0ff ASK_PULSE_PERIOD_MS=800 ASK_PULSE_IDLE=0 ASK_PULSE_HOLD_AFTER_MS=0` |
 
 ```json
-{ "color": "#ff10f0", "color2": "#0af0ff", "periodMs": 2000, "idle": true, "holdAfterMs": 1800000 }
+{ "color": "rainbow", "periodMs": 2000, "idle": true, "holdAfterMs": 1800000 }
 ```
+
+Setting `color` to a hex value or preset name switches every mode from the rainbow flow to the
+pre-v1.7 two-endpoint fade-and-bounce; `color2` (or a derived 24%-brightness dim, if omitted) is
+the second endpoint. `"rainbow"` (or omitting `color` entirely) switches back.
 
 The config is re-read on every mount, so a change lands on the next turn — no restart.
 
@@ -85,6 +103,9 @@ the repaint tick is killed — an unattended pane must not repaint at 30 Hz
 overnight. The locked state is just as visible as the pulse once you look at the screen.
 The deadline is re-derived inside `render()`, so a resize or re-layout after the tick dies
 still paints bright. `0` or negative disables the lock.
+
+In rainbow mode the hold lock freezes the clock rather than snapping to one hue, so a locked
+screen still reads as a full gradient instead of a single flat color.
 
 The pulse fades between two endpoints: `color` at the peak and `color2` at the trough (v1.5),
 interpolated in OKLab rather than per-channel RGB (v1.6) so the midpoint stays saturated instead of
@@ -104,6 +125,8 @@ Compile-time knobs still living in `src/ask-pulse.ts`: `FRAME_MS` (repaint tick)
   try/catch and silently no-ops there.
 - If `tool_execution_end` is skipped (Esc-aborted ask), `agent_end` and `session_shutdown`
   clear the banner.
+- The frame strips never take the editor's keyboard focus (`ownsOverlayFocusTarget` plus a
+  self-healing focus check on every render); a terminal below 8 columns or 4 rows hides them.
 - Colors are 24-bit truecolor; non-truecolor terminals approximate.
 - The only runtime imports are `bun` and `node:*` builtins; every omp package import is
   type-only, so the module resolves nothing from a package tree.
@@ -125,21 +148,21 @@ bun run test        # bun test
 
 ### Regenerating the preview GIFs
 
-`scripts/render-preview.ts` imports the real `AskPulseBanner` and writes one HTML file per frame —
-50 frames × 40 ms = one full 2000 ms period — so the published preview cannot drift from the code
-(the pre-v1.6 `scripts/frame.html` mirrored the color math by hand and did drift). Screenshot the
-`<pre>` element of each frame into `f000.png … f049.png`, then encode:
+`scripts/render-preview.ts` imports the real `AskPulseBanner`/`AskPulseStrip` and writes one HTML
+file per frame — 50 frames × 40 ms = one full 2000 ms period — so the published preview cannot
+drift from the code (the pre-v1.6 `scripts/frame.html` mirrored the color math by hand and did
+drift). Screenshot the `<pre>` element of each frame into `f000.png … f049.png`, then encode:
 
 ```
-bun scripts/render-preview.ts idle    # or: ask
+bun scripts/render-preview.ts idle    # or: ask, frame
 # screenshot each scripts/preview-idle-NNN.html <pre> to /tmp/frames/fNNN.png
 ffmpeg -framerate 25 -i /tmp/frames/f%03d.png \
   -vf "scale=800:-2:flags=lanczos,split[a][b];[a]palettegen=max_colors=64:stats_mode=diff[p];[b][p]paletteuse=dither=bayer:bayer_scale=4:diff_mode=rectangle" \
   -loop 0 docs/idle-wave.gif
 ```
 
-`ask` mode encodes to `docs/ask-pulse.gif` the same way. The generated `preview-*.html` files are
-gitignored; only the GIFs are committed.
+`ask` and `frame` mode encode to `docs/ask-pulse.gif` and `docs/rainbow-frame.gif` the same way.
+The generated `preview-*.html` files are gitignored; only the GIFs are committed.
 
 ## License
 
