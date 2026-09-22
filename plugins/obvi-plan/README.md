@@ -27,9 +27,12 @@ quitting omp) your terminal is handed back its own default background.
 ## Install
 
 ```
-/marketplace add mlg87/omp-obvi-plan
-/marketplace install obvi-plan@mlg87-obvi-plan
+/marketplace add mlg87/omp-plugins
+/marketplace install obvi-plan@mlg87
 ```
+
+`obvi-plan` is published in the `mlg87` marketplace ([mlg87/omp-plugins](https://github.com/mlg87/omp-plugins)),
+together with `ask-pulse`. If you already added it for ask-pulse, skip the first line.
 
 Restart the session — newly installed extension modules are loaded at startup.
 
