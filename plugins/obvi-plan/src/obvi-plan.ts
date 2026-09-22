@@ -12,7 +12,8 @@
 // `theme.light` slot from the luminance the terminal reports for OSC 11 (`docs/theme.md`), but only
 // probes at startup, on Mode 2031 notifications, and on Ctrl+L. After every background change the
 // extension asks the terminal to re-probe (`Terminal.refreshAppearance`), so a light tint like
-// lilac flips omp to its light slot — dark text, readable — and the restore flips it back. omp
+// lilac flips omp to its light slot — dark text, readable — and the restore flips it back (a dark
+// tint like the default midnight keeps omp on its dark slot, so nothing visibly switches). omp
 // applies that switch as ephemeral, so the user's saved theme settings are never touched. Users who
 // pinned a single theme instead of auto keep it; the re-probe is then a no-op.
 //
@@ -30,7 +31,7 @@
 //  - The reset is only ever written after this extension set a color, so a user's own OSC 11
 //    customization is never clobbered while the extension is idle.
 //  - `session_shutdown` and a process `exit` hook both reset, so quitting from inside plan mode
-//    (or a crash that still unwinds) never leaves the shell lilac.
+//    (or a crash that still unwinds) never leaves the shell tinted.
 //
 // Package imports are type-only (same rule as ask-pulse): the module resolves nothing from a
 // package tree at runtime, so it works from `~/.omp/agent/extensions/` as well as a plugin cache.
@@ -55,17 +56,20 @@ const PREVIEW_MS = 3000
 
 export type RGB = readonly [number, number, number]
 
-/** Lilac (#c8a2c8): the built-in plan-mode background. */
-export const DEFAULT_COLOR: RGB = [0xc8, 0xa2, 0xc8]
+/**
+ * Midnight (#1e1b3a): the built-in plan-mode background (1.1.0; lilac before). A dark tint keeps a
+ * dark omp theme's light text readable without relying on theme matching.
+ */
+export const DEFAULT_COLOR: RGB = [0x1e, 0x1b, 0x3a]
 
 /** Named colors, so `/obvi-plan color plum` beats memorising a hex triplet. */
 export const PRESETS: Readonly<Record<string, RGB>> = {
-  lilac: DEFAULT_COLOR,
+  lilac: [0xc8, 0xa2, 0xc8],
   lavender: [0xe6, 0xe6, 0xfa],
   mauve: [0xe0, 0xb0, 0xff],
   // Dark tints keep a dark omp theme's light text readable.
   plum: [0x3d, 0x2b, 0x4f],
-  midnight: [0x1e, 0x1b, 0x3a],
+  midnight: DEFAULT_COLOR,
 }
 
 /** Accepts `#rgb`, `#rrggbb`, either without the hash, or a {@link PRESETS} name. */
@@ -187,10 +191,10 @@ export class ModeTracker {
   #leafId: string | null | undefined // undefined = nothing resolved yet
   #mode = "none"
 
-  /** Returns the resolved mode and whether it differs from the previous call's. */
-  resolve(tree: SessionTree): { mode: string; changed: boolean } {
+  /** The session's current mode: the latest `mode_change` on the leaf's branch, or `"none"`. */
+  resolve(tree: SessionTree): string {
     const leafId = tree.getLeafId()
-    if (leafId === this.#leafId) return { mode: this.#mode, changed: false }
+    if (leafId === this.#leafId) return this.#mode
 
     let mode = "none"
     let id = leafId
@@ -207,13 +211,12 @@ export class ModeTracker {
       }
       id = entry.parentId
     }
-    const changed = mode !== this.#mode
     this.#leafId = leafId
     this.#mode = mode
-    return { mode, changed }
+    return mode
   }
 
-  /** Forget the cache, e.g. after a session switch. */
+  /** Forget the cache, e.g. after a session switch, so the next `resolve` walks the whole branch. */
   reset(): void {
     this.#leafId = undefined
     this.#mode = "none"
@@ -260,7 +263,7 @@ const USAGE = [
   "/obvi-plan on|off — enable or disable the tint without uninstalling",
   "/obvi-plan theme on|off — let omp's auto theme follow the tint (light tint → light theme)",
   "/obvi-plan preview — show the color for a few seconds",
-  "/obvi-plan reset — delete the user config (back to lilac)",
+  "/obvi-plan reset — delete the user config (back to midnight)",
 ].join("\n")
 
 export default function obviPlan(pi: ExtensionAPI) {
@@ -344,9 +347,12 @@ export default function obviPlan(pi: ExtensionAPI) {
     const ctx = latestCtx
     if (ctx === undefined || !usable(ctx)) return
     try {
-      const { mode, changed } = tracker.resolve(ctx.sessionManager)
-      if (!changed) return
-      inPlanMode = mode === "plan"
+      // Compare against what is painted, not against the tracker's previous answer: a session
+      // switch (`/new`, "Approve and execute", `/resume`) resets the tracker, and the new session's
+      // "none" must still read as leaving plan mode (issue #8).
+      const active = tracker.resolve(ctx.sessionManager) === "plan"
+      if (active === inPlanMode) return
+      inPlanMode = active
       config = loadConfig(ctx.cwd) // re-read per transition so a hand edit lands on the next toggle
       render(ctx)
     } catch {
@@ -468,7 +474,7 @@ export default function obviPlan(pi: ExtensionAPI) {
           if (existsSync(USER_CONFIG_PATH)) rmSync(USER_CONFIG_PATH)
           config = loadConfig(ctx.cwd)
           render(ctx)
-          ctx.ui.notify(`obvi-plan reset to lilac ${toHex(DEFAULT_COLOR)}`)
+          ctx.ui.notify(`obvi-plan reset to midnight ${toHex(DEFAULT_COLOR)}`)
           return
         }
         default:

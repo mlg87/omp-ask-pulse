@@ -1,18 +1,20 @@
 # obvi-plan
 
 Makes omp's plan mode impossible to miss. While plan mode is active, the whole terminal background
-turns lilac (or a color you choose). The moment plan mode ends, your terminal gets its own
-background back.
+turns a deep midnight blue (or a color you choose). The moment plan mode ends, your terminal gets
+its own background back.
 
 ## What you get
 
 - **A tinted background while planning.** It turns on however plan mode starts: `/plan`, the
   mode-cycle key, or resuming a session that was in plan mode. It covers everything omp draws
   without its own background color, which is most of the screen, including scrollback.
-- **Your background back afterwards.** It restores when you run `/plan` again, approve the plan,
-  pause plan mode, quit omp, or switch to a session that isn't in plan mode.
-- **Readable text on a light tint.** If omp picks its theme automatically (the default), it
-  switches to its light theme while the background is lilac and back to your usual theme
+- **Your background back afterwards.** It restores when you run `/plan` again, approve the plan
+  (including **Approve and execute**, which starts a new session), pause plan mode, start a new
+  session with `/new`, switch to a session that isn't in plan mode, or quit omp.
+- **Readable text on any tint.** The default, midnight, is dark, so a dark omp theme's light text
+  stays readable. If you pick a light color such as lilac and omp picks its theme automatically
+  (the default), omp switches to its light theme while tinted and back to your usual theme
   afterwards (see [Readable text](#readable-text)).
 - **Nothing permanent.** obvi-plan never reads or changes your terminal profile or your omp theme
   settings. A paused plan (`plan_paused`) counts as not in plan mode.
@@ -46,17 +48,17 @@ Without the marketplace, you can copy `src/obvi-plan.ts` into `~/.omp/agent/exte
 | `/obvi-plan on` / `off` | Turn the tint on or off without uninstalling. `off` during plan mode restores your background right away. |
 | `/obvi-plan theme on` / `off` | Turn theme matching on or off (see [Readable text](#readable-text)). |
 | `/obvi-plan preview` | Show the color for three seconds, even outside plan mode. |
-| `/obvi-plan reset` | Delete your user config, returning to lilac with theme matching on. |
+| `/obvi-plan reset` | Delete your user config, returning to midnight with theme matching on. |
 
 Presets:
 
 | Preset | Hex | Brightness |
 |---|---|---|
-| `lilac` | `#c8a2c8` | light (default) |
+| `lilac` | `#c8a2c8` | light (the default before 1.1.0) |
 | `lavender` | `#e6e6fa` | light |
 | `mauve` | `#e0b0ff` | light |
 | `plum` | `#3d2b4f` | dark |
-| `midnight` | `#1e1b3a` | dark |
+| `midnight` | `#1e1b3a` | dark (default) |
 
 ## Configuration
 
@@ -65,7 +67,7 @@ file, or use environment variables.
 
 | Key | Type | Default | Environment variable | Meaning |
 |---|---|---|---|---|
-| `color` | hex or preset | `"#c8a2c8"` (lilac) | `OBVI_PLAN_COLOR` | Background color during plan mode. |
+| `color` | hex or preset | `"#1e1b3a"` (midnight) | `OBVI_PLAN_COLOR` | Background color during plan mode. |
 | `enabled` | boolean | `true` | `OBVI_PLAN_ENABLED` | Tint the background at all. |
 | `matchTheme` | boolean | `true` | `OBVI_PLAN_MATCH_THEME` | Let omp's automatic theme follow the tint. |
 
@@ -90,27 +92,33 @@ session.
 
 ### Readable text
 
-Lilac is a light color, so light text on it is hard to read. omp's automatic theme picks
-between two themes, `theme.dark` and `theme.light`, based on how bright the terminal background
-is, but normally checks only at startup, when your OS switches between light and dark, and on
-Ctrl+L. With `matchTheme` on, obvi-plan asks omp to check again after every background change:
+The default tint, midnight, is dark: with a dark omp theme nothing needs to change, and theme
+matching leaves omp on its dark theme. Light tints (`lilac`, `lavender`, `mauve`, or a light hex
+color) are where it matters, because light text on them is hard to read.
 
-- **Plan mode on:** lilac reads as light, so omp switches to its light theme (dark text).
+omp's automatic theme picks between two themes, `theme.dark` and `theme.light`, based on how
+bright the terminal background is, but normally checks only at startup, when your OS switches
+between light and dark, and on Ctrl+L. With `matchTheme` on, obvi-plan asks omp to check again
+after every background change:
+
+- **Plan mode on:** a light tint reads as light, so omp switches to its light theme (dark text); a
+  dark tint reads as dark, so omp stays on its dark theme.
 - **Plan mode off:** your background comes back, and so does your usual theme.
 - **Session only:** omp treats the switch as temporary, so your saved settings are never written.
 
 Theme matching has no effect if you chose a single fixed theme instead of the automatic one. It
 also doesn't work in terminals that can't report their background color, including inside tmux:
-tmux tints the pane but reports the outer terminal's color. In those cases, pick a dark tint
-instead: `/obvi-plan color plum`.
+tmux tints the pane but reports the outer terminal's color. In those cases, stick to a dark tint
+such as the default midnight, or `plum`.
 
 `/obvi-plan theme off` stops omp from switching themes. If you turn it off while plan mode is
-tinted, omp stays on the light theme until plan mode ends, and still switches back then.
+tinted with a light color, omp stays on the light theme until plan mode ends, and still switches
+back then.
 
 ## How it works
 
 - **Setting the color:** obvi-plan sends the standard OSC 11 escape sequence
-  (`ESC ] 11 ; rgb:c8/a2/c8 BEL`). It changes the terminal's default background, so every cell
+  (`ESC ] 11 ; rgb:1e/1b/3a BEL` for midnight). It changes the terminal's default background, so every cell
   omp draws without its own background changes at once, with no redraw.
 - **Restoring:** it sends OSC 111 (`ESC ] 111 BEL`), which resets the background to your terminal
   profile's setting. It only sends this after it has set a color itself, so a background you set
@@ -119,14 +127,16 @@ tinted, omp stays on the light theme until plan mode ends, and still switches ba
   `mode_change` entry to the session each time plan mode starts, pauses, or ends; that's how omp
   restores the mode when you resume. Every 250 ms, obvi-plan checks whether the session has a new
   entry; that check is a single lookup. Only when something was added does it read back to the most
-  recent `mode_change`.
+  recent `mode_change`. When omp switches sessions (`/new`, `/resume`, or the new session that
+  **Approve and execute** starts), obvi-plan re-reads the new session right away and restores your
+  background unless that session is in plan mode.
 - **Theme matching:** after each background change it calls omp's `refreshAppearance()`, which asks
   the terminal for its background color. omp's automatic theme then picks a theme based on the
   answer.
 - **Ordering:** the escape sequences go through omp's own terminal writer, so the color change
   always reaches the terminal before the theme check.
 - **Cleanup:** leaving plan mode, `session_shutdown`, and a process `exit` handler all restore the
-  background, so quitting from inside plan mode never leaves your shell lilac.
+  background, so quitting from inside plan mode never leaves your shell tinted.
 
 ## Terminal support
 
@@ -156,8 +166,10 @@ tinted, omp stays on the light theme until plan mode ends, and still switches ba
   active. Try `/obvi-plan preview`; if even that shows no color, your terminal ignores OSC 11.
 - **Text is hard to read on the tint.** omp didn't switch themes. You probably have a fixed theme,
   or you're in tmux. Use a dark preset (`plum`, `midnight`), or switch omp to its automatic theme.
-- **The tint stays after plan mode ends.** Your terminal doesn't support OSC 111. Run
-  `printf '\e]111\a'` to clear it now, and `/obvi-plan off` to stop it happening again.
+- **The tint stays after plan mode ends.** On 1.0.0 this could happen after **Approve and
+  execute** or `/new` (fixed in 1.1.0; run `/marketplace upgrade obvi-plan@mlg87`). On 1.1.0 or
+  later it means your terminal doesn't support OSC 111. Either way, `printf '\e]111\a'` clears it
+  now, and `/obvi-plan off` stops it happening again.
 - **omp stays on the light theme after plan mode.** Press Ctrl+L so omp checks the background again.
 - **A project uses a different color than expected.** Run `/obvi-plan show`. A
   `<project>/.omp/obvi-plan.json` file or an `OBVI_PLAN_*` environment variable overrides your
@@ -200,6 +212,7 @@ Layout:
 
 | Version | Change |
 |---|---|
+| 1.1.0 | Fix: leaving plan mode by starting a new session (**Approve and execute**, `/new`, `/resume`) could leave the background tinted ([#8](https://github.com/mlg87/omp-plugins/issues/8)). The default color is now midnight (`#1e1b3a`) instead of lilac; `/obvi-plan color lilac` restores the old look. |
 | 1.0.0 | Initial release: lilac tint during plan mode, restore on exit, theme matching, `/obvi-plan` commands, and config files. |
 
 ## License
