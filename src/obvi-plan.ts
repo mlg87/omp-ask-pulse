@@ -8,6 +8,14 @@
 // once, no repaint needed — and OSC 111 resets it to whatever the terminal profile configures. The
 // user's theme is never read, stored, or rewritten, so "back to default" is exact by construction.
 //
+// Readability (`matchTheme`, on by default): omp's auto theme picks its `theme.dark` or
+// `theme.light` slot from the luminance the terminal reports for OSC 11 (`docs/theme.md`), but only
+// probes at startup, on Mode 2031 notifications, and on Ctrl+L. After every background change the
+// extension asks the terminal to re-probe (`Terminal.refreshAppearance`), so a light tint like
+// lilac flips omp to its light slot — dark text, readable — and the restore flips it back. omp
+// applies that switch as ephemeral, so the user's saved theme settings are never touched. Users who
+// pinned a single theme instead of auto keep it; the re-probe is then a no-op.
+//
 // Detection: omp has no plan-mode extension event. What it does do, on every transition (the `/plan`
 // command, the mode-cycle keybinding, plan approval, session resume/switch), is append a
 // `mode_change` entry to the session — `"plan"` on entry, `"none"` or `"plan_paused"` on exit —
@@ -31,8 +39,16 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { homedir } from "node:os"
 import { join } from "node:path"
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@oh-my-pi/pi-coding-agent"
+import type { TUI } from "@oh-my-pi/pi-tui"
 
 const CONFIG_BASENAME = "obvi-plan.json"
+/**
+ * Zero-row widget whose only job is to hand the extension a live `TUI`, for `terminal.write` (so
+ * the escape sequences share omp's own output path) and `terminal.refreshAppearance`.
+ */
+const PROBE_KEY = "obvi-plan-tui"
+/** Shared empty-render result for the probe widget; reference identity signals "unchanged" to pi-tui. */
+const EMPTY_ROWS: readonly string[] = []
 /** Mode-poll tick. Steady state is one `getLeafId()` call, so a quarter second costs nothing. */
 const POLL_MS = 250
 const PREVIEW_MS = 3000
@@ -109,6 +125,15 @@ function readConfigFile(path: string): Record<string, unknown> {
 export interface ObviPlanConfig {
   color: RGB
   enabled: boolean
+  /** Re-probe the terminal after each change so omp's auto theme follows the tint's luminance. */
+  matchTheme: boolean
+}
+
+/** JSON booleans, or "0"/"false"/"off"/"no" (anything else non-empty is true) from the environment. */
+function readFlag(raw: unknown): boolean | undefined {
+  if (typeof raw === "boolean") return raw
+  if (typeof raw === "string" && raw !== "") return !/^(0|false|off|no)$/i.test(raw)
+  return undefined
 }
 
 /**
@@ -119,20 +144,22 @@ export function loadConfig(cwd: string): ObviPlanConfig {
   const sources = [
     readConfigFile(USER_CONFIG_PATH),
     readConfigFile(join(cwd, ".omp", CONFIG_BASENAME)),
-    { color: process.env.OBVI_PLAN_COLOR, enabled: process.env.OBVI_PLAN_ENABLED },
+    {
+      color: process.env.OBVI_PLAN_COLOR,
+      enabled: process.env.OBVI_PLAN_ENABLED,
+      matchTheme: process.env.OBVI_PLAN_MATCH_THEME,
+    },
   ]
   let color = DEFAULT_COLOR
   let enabled = true
+  let matchTheme = true
   for (const source of sources) {
     const parsed = parseColor(source.color)
     if (parsed !== undefined) color = parsed
-    // Accept booleans from JSON and "0"/"false"/"off" from the environment, ignore anything else.
-    if (typeof source.enabled === "boolean") enabled = source.enabled
-    else if (typeof source.enabled === "string" && source.enabled !== "") {
-      enabled = !/^(0|false|off|no)$/i.test(source.enabled)
-    }
+    enabled = readFlag(source.enabled) ?? enabled
+    matchTheme = readFlag(source.matchTheme) ?? matchTheme
   }
-  return { color, enabled }
+  return { color, enabled, matchTheme }
 }
 
 /** Persist a partial config to the user file, preserving unrelated keys. */
@@ -209,18 +236,21 @@ export class Backdrop {
     return this.#applied
   }
 
-  /** `undefined` restores the terminal's own default background. */
-  apply(color: RGB | undefined): void {
+  /** `undefined` restores the terminal's own default background. Returns whether anything was written. */
+  apply(color: RGB | undefined): boolean {
     const current = this.#applied
     if (color === undefined) {
-      if (current === undefined) return
+      if (current === undefined) return false
       this.#applied = undefined
       this.#write(RESET_BACKGROUND)
-      return
+      return true
     }
-    if (current !== undefined && current[0] === color[0] && current[1] === color[1] && current[2] === color[2]) return
+    if (current !== undefined && current[0] === color[0] && current[1] === color[1] && current[2] === color[2]) {
+      return false
+    }
     this.#applied = color
     this.#write(setBackgroundSequence(color))
+    return true
   }
 }
 
@@ -228,6 +258,7 @@ const USAGE = [
   "/obvi-plan show — print the active color and where it came from",
   `/obvi-plan color <hex|preset> — set the plan-mode background (presets: ${Object.keys(PRESETS).join(" ")})`,
   "/obvi-plan on|off — enable or disable the tint without uninstalling",
+  "/obvi-plan theme on|off — let omp's auto theme follow the tint (light tint → light theme)",
   "/obvi-plan preview — show the color for a few seconds",
   "/obvi-plan reset — delete the user config (back to lilac)",
 ].join("\n")
@@ -236,9 +267,13 @@ export default function obviPlan(pi: ExtensionAPI) {
   pi.setLabel("Obvi Plan")
 
   const tracker = new ModeTracker()
+  let tuiRef: TUI | undefined
+  // Through omp's terminal while the TUI is up, so the write is ordered with the OSC 11 re-probe
+  // that follows it; straight to stdout once the TUI is gone (session teardown, process exit).
   const backdrop = new Backdrop((data) => {
     try {
-      process.stdout.write(data)
+      if (tuiRef !== undefined) tuiRef.terminal.write(data)
+      else process.stdout.write(data)
     } catch {
       // stdout closed during teardown — nothing left to tint.
     }
@@ -248,18 +283,61 @@ export default function obviPlan(pi: ExtensionAPI) {
   let previewTimer: Timer | undefined
   let inPlanMode = false
   let config: ObviPlanConfig | undefined
+  /**
+   * Whether omp's auto theme was last re-probed against a tint. Once true, the restore re-probes
+   * even if matching was switched off meanwhile — otherwise omp would keep the light slot over the
+   * user's dark background.
+   */
+  let themeShifted = false
 
   // Last-resort reset: a process exit that skips `session_shutdown` must not leave the shell tinted.
   // Synchronous on a TTY, which is the only case `usable` lets through.
-  process.once("exit", () => backdrop.apply(undefined))
+  process.once("exit", () => {
+    tuiRef = undefined
+    backdrop.apply(undefined)
+  })
 
   const usable = (ctx: ExtensionContext): boolean => ctx.hasUI && process.stdout.isTTY === true
+
+  /** Mount the zero-row probe widget once to capture the live `TUI`. Its factory runs synchronously. */
+  const ensureTui = (ctx: ExtensionContext): void => {
+    if (tuiRef !== undefined) return
+    try {
+      ctx.ui.setWidget(
+        PROBE_KEY,
+        (tui: TUI) => {
+          tuiRef = tui
+          return { render: () => EMPTY_ROWS, invalidate() {} }
+        },
+        { placement: "aboveEditor" },
+      )
+    } catch {
+      // Widget surface unavailable — fall back to stdout writes and skip theme matching.
+    }
+  }
+
+  /** Set or clear the tint, then let omp's auto theme re-read the new background's luminance. */
+  const paint = (color: RGB | undefined, matchTheme: boolean): void => {
+    if (!backdrop.apply(color)) return
+    const follow = matchTheme || themeShifted
+    themeShifted = follow && color !== undefined
+    if (follow) reprobe()
+  }
+
+  /** Ask the terminal for its background again; omp's auto theme re-evaluates on the reply. */
+  const reprobe = (): void => {
+    try {
+      tuiRef?.terminal.refreshAppearance?.()
+    } catch {
+      // Older pi-tui or a torn-down terminal — the tint still applies, only the theme stays put.
+    }
+  }
 
   /** Paint the background the current state calls for; a no-op when nothing changed. */
   const render = (ctx: ExtensionContext): void => {
     if (previewTimer !== undefined) return // a preview owns the background until it ends
     config ??= loadConfig(ctx.cwd)
-    backdrop.apply(inPlanMode && config.enabled ? config.color : undefined)
+    paint(inPlanMode && config.enabled ? config.color : undefined, config.matchTheme)
   }
 
   const poll = (): void => {
@@ -280,6 +358,7 @@ export default function obviPlan(pi: ExtensionAPI) {
   const attach = (ctx: ExtensionContext): void => {
     latestCtx = ctx
     if (!usable(ctx)) return
+    ensureTui(ctx)
     if (poller === undefined) poller = ctx.setInterval(poll, POLL_MS)
     poll()
   }
@@ -303,6 +382,8 @@ export default function obviPlan(pi: ExtensionAPI) {
     latestCtx = undefined
     tracker.reset()
     inPlanMode = false
+    themeShifted = false
+    tuiRef = undefined // the TUI is being torn down: write the reset straight to stdout, no re-probe
     backdrop.apply(undefined)
   })
 
@@ -322,9 +403,10 @@ export default function obviPlan(pi: ExtensionAPI) {
             existsSync(projectPath) ? `project: ${projectPath}` : undefined,
             process.env.OBVI_PLAN_COLOR !== undefined ? "env: OBVI_PLAN_COLOR" : undefined,
             process.env.OBVI_PLAN_ENABLED !== undefined ? "env: OBVI_PLAN_ENABLED" : undefined,
+            process.env.OBVI_PLAN_MATCH_THEME !== undefined ? "env: OBVI_PLAN_MATCH_THEME" : undefined,
           ].filter(Boolean)
           ctx.ui.notify(
-            `obvi-plan ${toHex(current.color)}, ${current.enabled ? "on" : "off"}, plan mode ${inPlanMode ? "active" : "inactive"}` +
+            `obvi-plan ${toHex(current.color)}, ${current.enabled ? "on" : "off"}, theme matching ${current.matchTheme ? "on" : "off"}, plan mode ${inPlanMode ? "active" : "inactive"}` +
               (origins.length > 0 ? ` (${origins.join(", ")})` : " (defaults)"),
           )
           return
@@ -352,11 +434,29 @@ export default function obviPlan(pi: ExtensionAPI) {
           ctx.ui.notify(`obvi-plan → ${subcommand}`)
           return
         }
+        case "theme": {
+          if (!/^(on|off)$/i.test(value)) {
+            ctx.ui.notify(`Usage: /obvi-plan theme <on|off> (got "${value}")`, "error")
+            return
+          }
+          const matchTheme = value.toLowerCase() === "on"
+          writeUserConfig({ matchTheme })
+          config = loadConfig(ctx.cwd)
+          // Switching on mid-plan re-probes now instead of waiting for a toggle. Switching off cannot
+          // un-shift a theme while the tint is still up (a re-probe would read the tint again); the
+          // restore at plan exit re-probes regardless, via `themeShifted`.
+          if (matchTheme && backdrop.applied !== undefined) {
+            themeShifted = true
+            reprobe()
+          }
+          ctx.ui.notify(`obvi-plan theme matching → ${matchTheme ? "on" : "off"}`)
+          return
+        }
         case "preview": {
           if (!usable(ctx)) return
           if (previewTimer !== undefined) ctx.clearTimer(previewTimer)
-          const color = loadConfig(ctx.cwd).color
-          backdrop.apply(color)
+          const { color, matchTheme } = loadConfig(ctx.cwd)
+          paint(color, matchTheme)
           previewTimer = ctx.setTimeout(() => {
             previewTimer = undefined
             render(ctx)

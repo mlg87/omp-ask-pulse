@@ -14,6 +14,7 @@ mkdirSync(agentDir, { recursive: true })
 process.env.PI_CODING_AGENT_DIR = agentDir
 delete process.env.OBVI_PLAN_COLOR
 delete process.env.OBVI_PLAN_ENABLED
+delete process.env.OBVI_PLAN_MATCH_THEME
 
 const {
   default: obviPlan,
@@ -62,29 +63,32 @@ describe("loadConfig", () => {
     rmSync(projectConfig, { force: true })
     delete process.env.OBVI_PLAN_COLOR
     delete process.env.OBVI_PLAN_ENABLED
+    delete process.env.OBVI_PLAN_MATCH_THEME
   })
 
-  test("defaults to lilac, enabled", () => {
-    expect(loadConfig(projectDir)).toEqual({ color: DEFAULT_COLOR, enabled: true })
+  test("defaults to lilac, enabled, matching the theme", () => {
+    expect(loadConfig(projectDir)).toEqual({ color: DEFAULT_COLOR, enabled: true, matchTheme: true })
   })
 
   test("user < project < environment", () => {
     writeFileSync(userConfig, JSON.stringify({ color: "#111111", enabled: false }))
-    expect(loadConfig(projectDir)).toEqual({ color: [0x11, 0x11, 0x11], enabled: false })
+    expect(loadConfig(projectDir)).toEqual({ color: [0x11, 0x11, 0x11], enabled: false, matchTheme: true })
 
-    writeFileSync(projectConfig, JSON.stringify({ color: "plum" }))
+    writeFileSync(projectConfig, JSON.stringify({ color: "plum", matchTheme: false }))
     expect(loadConfig(projectDir).color).toEqual([0x3d, 0x2b, 0x4f])
     expect(loadConfig(projectDir).enabled).toBe(false) // untouched keys fall through
 
     process.env.OBVI_PLAN_COLOR = "#abcdef"
     process.env.OBVI_PLAN_ENABLED = "1"
-    expect(loadConfig(projectDir)).toEqual({ color: [0xab, 0xcd, 0xef], enabled: true })
+    process.env.OBVI_PLAN_MATCH_THEME = "on"
+    expect(loadConfig(projectDir)).toEqual({ color: [0xab, 0xcd, 0xef], enabled: true, matchTheme: true })
   })
 
   test("reads off-ish environment strings as disabled", () => {
     for (const value of ["0", "false", "OFF", "no"]) {
       process.env.OBVI_PLAN_ENABLED = value
-      expect(loadConfig(projectDir).enabled).toBe(false)
+      process.env.OBVI_PLAN_MATCH_THEME = value
+      expect(loadConfig(projectDir)).toMatchObject({ enabled: false, matchTheme: false })
     }
   })
 
@@ -198,14 +202,14 @@ describe("Backdrop", () => {
 
   test("never resets a background it did not set", () => {
     const { writes, backdrop } = make()
-    backdrop.apply(undefined)
+    expect(backdrop.apply(undefined)).toBe(false)
     expect(writes).toEqual([])
   })
 
   test("sets once, then resets once", () => {
     const { writes, backdrop } = make()
-    backdrop.apply(lilac)
-    backdrop.apply([...lilac])
+    expect(backdrop.apply(lilac)).toBe(true)
+    expect(backdrop.apply([...lilac])).toBe(false)
     expect(writes).toEqual([setBackgroundSequence(lilac)])
     expect(backdrop.applied).toEqual(lilac)
 
@@ -226,7 +230,10 @@ describe("Backdrop", () => {
 describe("extension wiring", () => {
   type Handler = (event: unknown, ctx: unknown) => void
 
-  /** Boot the extension against a fake `pi`, a fake session tree, and a captured TTY stdout. */
+  /**
+   * Boot the extension against a fake `pi`, a fake session tree, and a fake TUI whose terminal
+   * records every write and re-probe in one ordered log. stdout is only claimed to be a TTY.
+   */
   const boot = () => {
     const handlers = new Map<string, Handler>()
     const pi = {
@@ -237,11 +244,23 @@ describe("extension wiring", () => {
       registerCommand() {},
     }
     const tree = new FakeTree()
+    const log: string[] = []
+    const tui = {
+      terminal: {
+        write: (data: string) => log.push(data),
+        refreshAppearance: () => log.push("reprobe"),
+      },
+    }
     let tick: (() => void) | undefined
     const ctx = {
       hasUI: true,
       cwd: projectDir,
       sessionManager: tree,
+      ui: {
+        setWidget(_key: string, factory: (tui: unknown) => unknown) {
+          factory(tui)
+        },
+      },
       setInterval(callback: () => void) {
         tick = callback
         return 1 as unknown as Timer
@@ -249,11 +268,11 @@ describe("extension wiring", () => {
       setTimeout: () => 2 as unknown as Timer,
       clearTimer() {},
     }
-    const writes: string[] = []
+    const stdout: string[] = []
     const wasTTY = process.stdout.isTTY
     process.stdout.isTTY = true
     const spy = spyOn(process.stdout, "write").mockImplementation((data: string | Uint8Array) => {
-      writes.push(String(data))
+      stdout.push(String(data))
       return true
     })
     const restore = () => {
@@ -262,50 +281,77 @@ describe("extension wiring", () => {
     }
     obviPlan(pi as never)
     const emit = (event: string) => handlers.get(event)?.({}, ctx)
-    return { tree, writes, emit, tick: () => tick?.(), restore }
+    return { tree, log, stdout, emit, tick: () => tick?.(), restore }
   }
 
-  test("tints on plan entry, restores on exit and on shutdown", () => {
-    const { tree, writes, emit, tick, restore } = boot()
+  const lilac = setBackgroundSequence(DEFAULT_COLOR)
+
+  test("tints on plan entry and restores on exit, re-probing the theme after each", () => {
+    const { tree, log, emit, tick, restore } = boot()
     try {
       emit("session_start")
-      expect(writes).toEqual([]) // not in plan mode: the terminal is never touched
+      expect(log).toEqual([]) // not in plan mode: the terminal is never touched
 
       tree.append("mode_change", "plan")
       tick()
-      expect(writes).toEqual([setBackgroundSequence(DEFAULT_COLOR)])
+      expect(log).toEqual([lilac, "reprobe"]) // the set must reach the terminal before the probe
 
       tree.append("message")
       tick()
-      expect(writes).toHaveLength(1)
+      expect(log).toHaveLength(2)
 
-      tree.append("mode_change", "none")
+      tree.append("mode_change", "plan_paused")
       tick()
-      expect(writes).toEqual([setBackgroundSequence(DEFAULT_COLOR), RESET_BACKGROUND])
-
-      tree.append("mode_change", "plan")
-      tick()
+      expect(log).toEqual([lilac, "reprobe", RESET_BACKGROUND, "reprobe"])
+    } finally {
       emit("session_shutdown")
-      expect(writes.slice(2)).toEqual([setBackgroundSequence(DEFAULT_COLOR), RESET_BACKGROUND])
+      restore()
+    }
+  })
+
+  test("shutdown inside plan mode resets straight to stdout", () => {
+    const { tree, log, stdout, emit, restore } = boot()
+    try {
+      tree.append("mode_change", "plan")
+      emit("session_start")
+      emit("session_shutdown")
+      expect(log).toEqual([lilac, "reprobe"])
+      expect(stdout).toEqual([RESET_BACKGROUND])
     } finally {
       restore()
     }
   })
 
-  test("uses the configured color and honors enabled: false", () => {
-    const { tree, writes, emit, tick, restore } = boot()
+  test("uses the configured color, honors enabled: false, and skips re-probes with matchTheme: false", () => {
+    const { tree, log, emit, tick, restore } = boot()
     try {
-      writeFileSync(projectConfig, JSON.stringify({ color: "#102030" }))
+      writeFileSync(projectConfig, JSON.stringify({ color: "#102030", matchTheme: false }))
       tree.append("mode_change", "plan")
       emit("session_start")
-      expect(writes).toEqual([setBackgroundSequence([0x10, 0x20, 0x30])])
+      expect(log).toEqual([setBackgroundSequence([0x10, 0x20, 0x30])])
 
-      writeFileSync(projectConfig, JSON.stringify({ enabled: false }))
+      writeFileSync(projectConfig, JSON.stringify({ enabled: false, matchTheme: false }))
       tree.append("mode_change", "none")
       tick()
       tree.append("mode_change", "plan") // config is re-read per transition
       tick()
-      expect(writes).toEqual([setBackgroundSequence([0x10, 0x20, 0x30]), RESET_BACKGROUND])
+      expect(log).toEqual([setBackgroundSequence([0x10, 0x20, 0x30]), RESET_BACKGROUND])
+    } finally {
+      emit("session_shutdown")
+      rmSync(projectConfig, { force: true })
+      restore()
+    }
+  })
+
+  test("a theme shifted by the tint is shifted back even if matching was turned off meanwhile", () => {
+    const { tree, log, emit, tick, restore } = boot()
+    try {
+      tree.append("mode_change", "plan")
+      emit("session_start")
+      writeFileSync(projectConfig, JSON.stringify({ matchTheme: false }))
+      tree.append("mode_change", "none")
+      tick()
+      expect(log).toEqual([lilac, "reprobe", RESET_BACKGROUND, "reprobe"])
     } finally {
       emit("session_shutdown")
       rmSync(projectConfig, { force: true })
