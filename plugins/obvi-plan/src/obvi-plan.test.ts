@@ -41,7 +41,8 @@ describe("parseColor", () => {
   })
 
   test("resolves presets case-insensitively", () => {
-    expect(parseColor("Lilac")).toEqual(DEFAULT_COLOR)
+    expect(parseColor("Lilac")).toEqual([0xc8, 0xa2, 0xc8])
+    expect(parseColor("MIDNIGHT")).toEqual(DEFAULT_COLOR)
     expect(parseColor(" plum ")).toEqual([0x3d, 0x2b, 0x4f])
   })
 
@@ -53,8 +54,8 @@ describe("parseColor", () => {
   })
 })
 
-test("the default is lilac", () => {
-  expect(toHex(DEFAULT_COLOR)).toBe("#c8a2c8")
+test("the default is midnight", () => {
+  expect(toHex(DEFAULT_COLOR)).toBe("#1e1b3a")
 })
 
 describe("loadConfig", () => {
@@ -66,7 +67,7 @@ describe("loadConfig", () => {
     delete process.env.OBVI_PLAN_MATCH_THEME
   })
 
-  test("defaults to lilac, enabled, matching the theme", () => {
+  test("defaults to midnight, enabled, matching the theme", () => {
     expect(loadConfig(projectDir)).toEqual({ color: DEFAULT_COLOR, enabled: true, matchTheme: true })
   })
 
@@ -130,28 +131,28 @@ class FakeTree {
 
 describe("ModeTracker", () => {
   test("an empty session is not in plan mode", () => {
-    expect(new ModeTracker().resolve(new FakeTree())).toEqual({ mode: "none", changed: false })
+    expect(new ModeTracker().resolve(new FakeTree())).toBe("none")
   })
 
   test("follows plan entry, pause, and exit", () => {
     const tree = new FakeTree()
     const tracker = new ModeTracker()
     tree.append("message")
-    expect(tracker.resolve(tree)).toEqual({ mode: "none", changed: false })
+    expect(tracker.resolve(tree)).toBe("none")
 
     tree.append("mode_change", "plan")
-    expect(tracker.resolve(tree)).toEqual({ mode: "plan", changed: true })
+    expect(tracker.resolve(tree)).toBe("plan")
 
     tree.append("message")
     tree.append("message")
-    expect(tracker.resolve(tree)).toEqual({ mode: "plan", changed: false })
+    expect(tracker.resolve(tree)).toBe("plan")
 
     tree.append("mode_change", "plan_paused")
-    expect(tracker.resolve(tree)).toEqual({ mode: "plan_paused", changed: true })
+    expect(tracker.resolve(tree)).toBe("plan_paused")
 
     tree.append("mode_change", "plan")
     tree.append("mode_change", "none")
-    expect(tracker.resolve(tree)).toEqual({ mode: "none", changed: true })
+    expect(tracker.resolve(tree)).toBe("none")
   })
 
   test("an unchanged leaf does no lookups, and appends walk only the new entries", () => {
@@ -167,7 +168,7 @@ describe("ModeTracker", () => {
 
     tree.append("message")
     tree.append("message")
-    expect(tracker.resolve(tree).mode).toBe("plan")
+    expect(tracker.resolve(tree)).toBe("plan")
     expect(tree.lookups).toBe(2)
   })
 
@@ -177,10 +178,10 @@ describe("ModeTracker", () => {
     const fork = tree.append("message")
     tree.append("mode_change", "plan")
     tree.append("message")
-    expect(tracker.resolve(tree).mode).toBe("plan")
+    expect(tracker.resolve(tree)).toBe("plan")
 
     tree.leaf = fork // navigate back to before plan mode was entered
-    expect(tracker.resolve(tree)).toEqual({ mode: "none", changed: true })
+    expect(tracker.resolve(tree)).toBe("none")
   })
 
   test("reset forgets the cached mode", () => {
@@ -189,12 +190,12 @@ describe("ModeTracker", () => {
     tree.append("mode_change", "plan")
     tracker.resolve(tree)
     tracker.reset()
-    expect(tracker.resolve(tree)).toEqual({ mode: "plan", changed: true })
+    expect(tracker.resolve(tree)).toBe("plan")
   })
 })
 
 describe("Backdrop", () => {
-  const lilac = DEFAULT_COLOR
+  const tint = DEFAULT_COLOR
   const make = () => {
     const writes: string[] = []
     return { writes, backdrop: new Backdrop((data) => writes.push(data)) }
@@ -208,22 +209,22 @@ describe("Backdrop", () => {
 
   test("sets once, then resets once", () => {
     const { writes, backdrop } = make()
-    expect(backdrop.apply(lilac)).toBe(true)
-    expect(backdrop.apply([...lilac])).toBe(false)
-    expect(writes).toEqual([setBackgroundSequence(lilac)])
-    expect(backdrop.applied).toEqual(lilac)
+    expect(backdrop.apply(tint)).toBe(true)
+    expect(backdrop.apply([...tint])).toBe(false)
+    expect(writes).toEqual([setBackgroundSequence(tint)])
+    expect(backdrop.applied).toEqual(tint)
 
     backdrop.apply(undefined)
     backdrop.apply(undefined)
-    expect(writes).toEqual([setBackgroundSequence(lilac), RESET_BACKGROUND])
+    expect(writes).toEqual([setBackgroundSequence(tint), RESET_BACKGROUND])
     expect(backdrop.applied).toBeUndefined()
   })
 
   test("a color change rewrites without an intermediate reset", () => {
     const { writes, backdrop } = make()
-    backdrop.apply(lilac)
+    backdrop.apply(tint)
     backdrop.apply([0x3d, 0x2b, 0x4f])
-    expect(writes).toEqual([setBackgroundSequence(lilac), setBackgroundSequence([0x3d, 0x2b, 0x4f])])
+    expect(writes).toEqual([setBackgroundSequence(tint), setBackgroundSequence([0x3d, 0x2b, 0x4f])])
   })
 })
 
@@ -284,7 +285,7 @@ describe("extension wiring", () => {
     return { tree, log, stdout, emit, tick: () => tick?.(), restore }
   }
 
-  const lilac = setBackgroundSequence(DEFAULT_COLOR)
+  const tint = setBackgroundSequence(DEFAULT_COLOR)
 
   test("tints on plan entry and restores on exit, re-probing the theme after each", () => {
     const { tree, log, emit, tick, restore } = boot()
@@ -294,7 +295,7 @@ describe("extension wiring", () => {
 
       tree.append("mode_change", "plan")
       tick()
-      expect(log).toEqual([lilac, "reprobe"]) // the set must reach the terminal before the probe
+      expect(log).toEqual([tint, "reprobe"]) // the set must reach the terminal before the probe
 
       tree.append("message")
       tick()
@@ -302,7 +303,7 @@ describe("extension wiring", () => {
 
       tree.append("mode_change", "plan_paused")
       tick()
-      expect(log).toEqual([lilac, "reprobe", RESET_BACKGROUND, "reprobe"])
+      expect(log).toEqual([tint, "reprobe", RESET_BACKGROUND, "reprobe"])
     } finally {
       emit("session_shutdown")
       restore()
@@ -315,7 +316,7 @@ describe("extension wiring", () => {
       tree.append("mode_change", "plan")
       emit("session_start")
       emit("session_shutdown")
-      expect(log).toEqual([lilac, "reprobe"])
+      expect(log).toEqual([tint, "reprobe"])
       expect(stdout).toEqual([RESET_BACKGROUND])
     } finally {
       restore()
@@ -343,6 +344,56 @@ describe("extension wiring", () => {
     }
   })
 
+  // Issue #8: "Approve and execute" exits plan mode and starts a fresh session (omp's
+  // `newSession`, which emits `session_switch`) before the next tick. The switch must restore.
+  test("a session switch out of plan mode restores the background", () => {
+    const { tree, log, emit, tick, restore } = boot()
+    try {
+      tree.append("mode_change", "plan")
+      emit("session_start")
+      expect(log).toEqual([tint, "reprobe"])
+
+      tree.append("mode_change", "none") // plan exit, no tick in between…
+      tree.leaf = null // …then the new, empty session
+      emit("session_switch")
+      expect(log).toEqual([tint, "reprobe", RESET_BACKGROUND, "reprobe"])
+
+      tick()
+      expect(log).toHaveLength(4)
+    } finally {
+      emit("session_shutdown")
+      restore()
+    }
+  })
+
+  test("/new from inside plan mode restores the background", () => {
+    const { tree, log, emit, restore } = boot()
+    try {
+      tree.append("mode_change", "plan")
+      emit("session_start")
+      tree.leaf = null // new session, never in plan mode, no mode_change at all
+      emit("session_switch")
+      expect(log).toEqual([tint, "reprobe", RESET_BACKGROUND, "reprobe"])
+    } finally {
+      emit("session_shutdown")
+      restore()
+    }
+  })
+
+  test("switching into a session that is in plan mode tints it", () => {
+    const { tree, log, emit, restore } = boot()
+    try {
+      emit("session_start")
+      tree.leaf = null
+      tree.append("mode_change", "plan") // the resumed session's branch
+      emit("session_switch")
+      expect(log).toEqual([tint, "reprobe"])
+    } finally {
+      emit("session_shutdown")
+      restore()
+    }
+  })
+
   test("a theme shifted by the tint is shifted back even if matching was turned off meanwhile", () => {
     const { tree, log, emit, tick, restore } = boot()
     try {
@@ -351,7 +402,7 @@ describe("extension wiring", () => {
       writeFileSync(projectConfig, JSON.stringify({ matchTheme: false }))
       tree.append("mode_change", "none")
       tick()
-      expect(log).toEqual([lilac, "reprobe", RESET_BACKGROUND, "reprobe"])
+      expect(log).toEqual([tint, "reprobe", RESET_BACKGROUND, "reprobe"])
     } finally {
       emit("session_shutdown")
       rmSync(projectConfig, { force: true })
