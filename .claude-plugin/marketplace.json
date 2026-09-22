@@ -32,12 +32,7 @@
     {
       "name": "obvi-plan",
       "description": "Tints the terminal background while omp plan mode is active and restores your theme when you leave it.",
-      "source": {
-        "source": "git-subdir",
-        "url": "https://github.com/mlg87/omp-obvi-plan.git",
-        "path": "plugins/obvi-plan",
-        "ref": "main"
-      },
+      "source": "./obvi-plan",
       "version": "1.0.0",
       "author": {
         "name": "Mason Goetz"
@@ -50,8 +45,8 @@
         "theme",
         "extension"
       ],
-      "homepage": "https://github.com/mlg87/omp-obvi-plan",
-      "repository": "https://github.com/mlg87/omp-obvi-plan"
+      "homepage": "https://github.com/mlg87/omp-plugins",
+      "repository": "https://github.com/mlg87/omp-plugins"
     }
   ]
 }
