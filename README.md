@@ -1,41 +1,130 @@
 # mlg87 omp plugins
 
-An [omp](https://github.com/oh-my-pi/pi-coding-agent) plugin marketplace.
+A small collection of plugins for [omp](https://github.com/oh-my-pi/pi-coding-agent), published as
+the `mlg87` plugin marketplace. Each plugin is independent: install only the ones you want.
+
+## Plugins
+
+| Plugin | What it does |
+|---|---|
+| [`ask-pulse`](plugins/ask-pulse) | Frames the agent's last reply and the input box in an animated banner whenever the agent is waiting for you, so a finished turn is impossible to miss. |
+| [`obvi-plan`](plugins/obvi-plan) | Tints the terminal background while plan mode is active (lilac by default) and restores your own background when you leave it. |
+
+Each plugin's README covers what it does in detail, its commands and configuration, its known
+limitations, and its changelog.
+
+## Install
+
+Add the marketplace once:
 
 ```
 /marketplace add mlg87/omp-plugins
-/marketplace discover mlg87
 ```
 
-| Plugin | Description |
-|---|---|
-| [`ask-pulse`](plugins/ask-pulse) | Pulsing dayglo banner above the `ask` dialog so a waiting agent is impossible to miss. |
-| [`obvi-plan`](plugins/obvi-plan) | Tints the terminal background (lilac by default) while plan mode is active, and restores your theme when you leave it. |
-
-![ask-pulse ask dialog banner](plugins/ask-pulse/docs/ask-pulse.gif)
-
-![ask-pulse idle caret wave](plugins/ask-pulse/docs/idle-wave.gif)
-
-Install one:
+Then install any plugin by name:
 
 ```
 /marketplace install ask-pulse@mlg87
 /marketplace install obvi-plan@mlg87
 ```
 
-## Local development
+Restart the omp session afterwards: omp loads extension modules only at startup.
+
+- **Browse:** `/marketplace discover mlg87` lists every plugin in this marketplace, and
+  `/marketplace` with no arguments opens omp's interactive browser.
+- **Per project:** add `--scope project` to `install` to enable a plugin for the current project
+  only instead of for every project.
+- **From the shell:** every command has a CLI form, e.g.
+  `omp plugin marketplace add mlg87/omp-plugins` and `omp plugin install obvi-plan@mlg87`.
+
+## Updating
+
+```
+/marketplace update mlg87          # refresh the catalog
+/marketplace upgrade               # upgrade every installed plugin that has a newer catalog version
+```
+
+By default omp only notes available updates in its debug log. To have updates installed
+automatically at startup:
+
+```
+omp config set marketplace.autoUpdate auto
+```
+
+## Disabling and removing
+
+```
+/plugins disable obvi-plan@mlg87          # keep it installed but stop loading it
+/plugins enable obvi-plan@mlg87
+/marketplace uninstall obvi-plan@mlg87    # remove it
+/marketplace remove mlg87                 # forget the marketplace (installed plugins stay)
+```
+
+Each plugin keeps its own settings file in `~/.omp/agent/` (named after the plugin), which
+uninstalling leaves in place; delete it by hand if you want a clean slate.
+
+## Repository layout
+
+```
+.omp-plugin/marketplace.json     marketplace catalog read by omp
+.claude-plugin/marketplace.json  identical copy, the Claude Code-compatible fallback location
+plugins/
+  <name>/
+    package.json                 declares the extension entry point under "omp.extensions"
+    src/                         extension source and its tests
+    README.md                    plugin documentation
+```
+
+Each plugin is a self-contained Bun + TypeScript package with its own lockfile, lint
+([Biome](https://biomejs.dev)), strict typecheck, and `bun test` suite. The only shared state is the
+catalog.
+
+## Development
+
+Work on a plugin from its own directory:
+
+```
+cd plugins/<name>
+bun install
+bun run lint        # biome
+bun run typecheck   # tsc --strict
+bun run test        # bun test
+```
+
+To try local changes in omp, either link one plugin straight from your checkout:
+
+```
+omp plugin link ./plugins/<name>
+```
+
+or install from this checkout as a local marketplace:
 
 ```
 /marketplace add ./omp-plugins
-/marketplace install --force ask-pulse@mlg87
-/marketplace install --force obvi-plan@mlg87
+/marketplace install --force <name>@mlg87
 ```
 
-Each plugin is a self-contained package under `plugins/<name>` with its own `package.json`,
-lockfile, lint, typecheck, and tests; run `bun install` and the checks from that directory.
+Restart the session after either.
 
-A release bumps the plugin's `version` in its `package.json` and in both catalog files together:
-`omp plugin upgrade` compares catalog versions, so users only see a release once the catalog says so.
+### Adding a plugin
 
-The catalog is published at both `.omp-plugin/marketplace.json` (read by omp) and
-`.claude-plugin/marketplace.json` (Claude Code compatible fallback); keep them in sync.
+1. Create `plugins/<name>/` with a `package.json` whose `omp.extensions` lists the entry module
+   (see an existing plugin for the Biome, tsconfig, and script setup).
+2. Add an entry to `plugins` in **both** catalog files with `"source": "./<name>"` (the catalog's
+   `metadata.pluginRoot` is `./plugins`), a `version`, and a description.
+3. Add a row to the table above and write the plugin's README.
+
+### Releasing
+
+A release is one PR that:
+
+1. bumps `version` in the plugin's `package.json`;
+2. bumps the same `version` in both catalog files, which must stay identical;
+3. adds a row to the changelog in the plugin's README.
+
+`omp plugin upgrade` compares catalog versions, so users only receive a release once the catalog
+says so.
+
+## License
+
+MIT, see [LICENSE](LICENSE). Each plugin also ships its own copy.
