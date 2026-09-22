@@ -26,8 +26,32 @@
         "notification",
         "extension"
       ],
-      "homepage": "https://github.com/mlg87/omp-ask-pulse",
-      "repository": "https://github.com/mlg87/omp-ask-pulse"
+      "homepage": "https://github.com/mlg87/omp-plugins",
+      "repository": "https://github.com/mlg87/omp-plugins"
+    },
+    {
+      "name": "obvi-plan",
+      "description": "Tints the terminal background while omp plan mode is active and restores your theme when you leave it.",
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/mlg87/omp-obvi-plan.git",
+        "path": "plugins/obvi-plan",
+        "ref": "main"
+      },
+      "version": "1.0.0",
+      "author": {
+        "name": "Mason Goetz"
+      },
+      "category": "productivity",
+      "license": "MIT",
+      "keywords": [
+        "tui",
+        "plan-mode",
+        "theme",
+        "extension"
+      ],
+      "homepage": "https://github.com/mlg87/omp-obvi-plan",
+      "repository": "https://github.com/mlg87/omp-obvi-plan"
     }
   ]
 }
