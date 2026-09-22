@@ -1,19 +1,20 @@
 # ask-pulse
 
-A pulsing dayglo banner for a waiting agent, framing the whole screen so it is impossible to miss
+A pulsing dayglo banner for a waiting agent, framing the last reply so it is impossible to miss
 in a wall of terminal panes.
 
-Two modes, both pinned below all transcript output, plus a caret frame around the whole screen:
+Two modes:
 
 - **ask** — a rounded box carrying the questions, for the whole life of an `ask` dialog.
-- **idle** — a caret rule (`>>> WAITING FOR YOUR INPUT <<<`) whenever the agent yields the turn at
-  all, including a plain prose answer that never called `ask`. Cleared the moment you submit.
-- **frame** (v1.7) — a caret strip across the top row and full-height down both side columns,
-  continuous with the rule above the editor, so the *whole* screen reads as "waiting", not just
-  the line above the prompt.
+- **idle** — a caret rule (`^^^ WAITING FOR YOUR INPUT ^^^`) above the editor whenever the agent
+  yields the turn at all, including a plain prose answer that never called `ask`, plus a full-width
+  `v` divider appended to the transcript directly above that reply (v1.8). The divider is dim while
+  the agent works and animates once the turn yields; it stays a dim `v` line in scrollback only when
+  the reply was taller than the screen (removing an already-scrolled-off row would corrupt history).
+  Both are cleared the moment you submit.
 
-By default all three flow a rainbow hue along the frame toward the text (v1.7); `/ask-pulse color
-<a> [b]` switches back to the pre-v1.7 two-color fade-and-bounce.
+By default both flow a rainbow hue toward the text (v1.7); `/ask-pulse color <a> [b]` switches back
+to the pre-v1.7 two-color fade-and-bounce.
 
 Wrapping the assistant's actual response text is not possible from an extension:
 `registerMessageRenderer` only accepts custom message types, decorating real transcript blocks
@@ -35,13 +36,15 @@ and `AskDialogComponent` is not exported from the public component barrel — th
 seam to animate it from outside. Patching the installed package would be erased by omp's
 several releases per day. So this mounts an *adjacent* animated banner through the stable
 extension API (`pi.setWidget(..., { placement: "aboveEditor" })`), which renders immediately
-above the editor container the dialog lives in, plus three overlay strips
-(`TUI.showOverlay`) framing the top row and both side columns.
+above the editor container the dialog lives in, plus a divider component (v1.8) appended to
+omp's transcript at each assistant `message_start` so the rainbow frames the specific reply the
+agent just gave, not the whole screen.
 
 Fading the transcript text itself (every line the agent already printed) is not reachable from an
 extension at all: `setTheme(ThemeObject)` is rejected ("Direct theme object not supported"),
 `setHeader`/`setFooter` are no-ops, and the components that paint transcript text have no external
-seam. The overlay frame is the closest attention-grabbing effect the documented surface allows.
+seam. A transcript divider plus the rule above the editor is the closest attention-grabbing effect
+the documented surface allows.
 
 ## Install
 
@@ -125,8 +128,9 @@ Compile-time knobs still living in `src/ask-pulse.ts`: `FRAME_MS` (repaint tick)
   try/catch and silently no-ops there.
 - If `tool_execution_end` is skipped (Esc-aborted ask), `agent_end` and `session_shutdown`
   clear the banner.
-- The frame strips never take the editor's keyboard focus (`ownsOverlayFocusTarget` plus a
-  self-healing focus check on every render); a terminal below 8 columns or 4 rows hides them.
+- The divider is a transcript block found by duck-typing omp's `TranscriptContainer`; if the
+  container is not found the divider is skipped and only the rule renders. It is never removed
+  once it may have reached terminal scrollback.
 - Colors are 24-bit truecolor; non-truecolor terminals approximate.
 - The only runtime imports are `bun` and `node:*` builtins; every omp package import is
   type-only, so the module resolves nothing from a package tree.
@@ -148,7 +152,7 @@ bun run test        # bun test
 
 ### Regenerating the preview GIFs
 
-`scripts/render-preview.ts` imports the real `AskPulseBanner`/`AskPulseStrip` and writes one HTML
+`scripts/render-preview.ts` imports the real `AskPulseBanner`/`AskPulseDivider` and writes one HTML
 file per frame — 50 frames × 40 ms = one full 2000 ms period — so the published preview cannot
 drift from the code (the pre-v1.6 `scripts/frame.html` mirrored the color math by hand and did
 drift). Screenshot the `<pre>` element of each frame into `f000.png … f049.png`, then encode:

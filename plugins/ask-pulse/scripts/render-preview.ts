@@ -11,7 +11,7 @@
 
 import { rmSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
-import { AskPulseBanner, AskPulseStrip, type FrameHost } from "../src/ask-pulse.ts"
+import { AskPulseBanner, AskPulseDivider } from "../src/ask-pulse.ts"
 
 const FRAMES = 50
 const FRAME_STEP_MS = 40 // 50 × 40 ms = 2000 ms = one default period
@@ -33,7 +33,12 @@ const PALETTE = {
 } as const
 const SAMPLE_QUESTIONS = ["Apply the migration to production?"]
 const FRAME_COLS = 100
-const FRAME_ROWS = 28
+const REPLY_LINES = [
+  "Done.",
+  "",
+  "- Checked out main, fetched, fast-forwarded to origin/main.",
+  "- Working tree clean, no local changes.",
+]
 
 const ESC = String.fromCharCode(0x1b)
 // `paint()`/`paintCells()` only ever emit these two sequences, so a two-token parser is sufficient.
@@ -76,37 +81,27 @@ const realNow = Date.now
 const base = 2_000_000
 const banner = new AskPulseBanner(mode === "idle" ? [] : SAMPLE_QUESTIONS, GLYPHS, PALETTE)
 
-// `frame` mode never calls `showOverlay` — the strips are rendered directly, off the overlay
-// stack, so the preview needs no real TUI to drive the frame's geometry.
-const frameHost: FrameHost = {
-  terminal: { columns: FRAME_COLS, rows: FRAME_ROWS },
-  getFocused: () => null,
-  setFocus() {},
-  showOverlay() {
-    throw new Error("preview never mounts")
-  },
-}
-const frameState = { palette: PALETTE, mountedAt: base, home: null }
-const topStrip = new AskPulseStrip("top", frameHost, frameState)
-const leftStrip = new AskPulseStrip("left", frameHost, frameState)
-const rightStrip = new AskPulseStrip("right", frameHost, frameState)
-const ruleBanner = new AskPulseBanner([], GLYPHS, PALETTE, () => ({ cols: FRAME_COLS, rows: FRAME_ROWS }))
+const divider = new AskPulseDivider((text) => `${ESC}[38;2;85;85;95m${text}${ESC}[39m`)
+Date.now = () => base
+divider.activate(PALETTE)
+Date.now = realNow
+const ruleBanner = new AskPulseBanner([], GLYPHS, PALETTE)
 const editorMock = `${ESC}[38;2;80;80;99m>${ESC}[39m ${" ".repeat(FRAME_COLS - 2)}`
+const replyLines = REPLY_LINES.map((line) => `${ESC}[38;2;200;200;210m${line}${ESC}[39m`)
 
 for (let frame = 0; frame < FRAMES; frame++) {
   const now = base + frame * FRAME_STEP_MS
   Date.now = () => now
   let lines: readonly string[]
   if (mode === "frame") {
-    const topLine = topStrip.render(FRAME_COLS)[0] ?? ""
-    const leftLines = leftStrip.render(1)
-    const rightLines = rightStrip.render(1)
-    const ruleLine = ruleBanner.render(FRAME_COLS)[0] ?? ""
-    const blank = " ".repeat(FRAME_COLS - 2)
-    const body: string[] = [topLine]
-    for (let r = 0; r < FRAME_ROWS - 3; r++) body.push(`${leftLines[r] ?? " "}${blank}${rightLines[r] ?? " "}`)
-    body.push(ruleLine, editorMock)
-    lines = body
+    lines = [
+      divider.render(FRAME_COLS)[0] ?? "",
+      "",
+      ...replyLines,
+      "",
+      ruleBanner.render(FRAME_COLS)[0] ?? "",
+      editorMock,
+    ]
   } else {
     lines = banner.render(WIDTH)
   }

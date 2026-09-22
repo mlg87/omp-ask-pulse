@@ -12,13 +12,9 @@
 // which renders immediately above `editorContainer`; the ask dialog is mounted *into*
 // `editorContainer`. The banner therefore sits directly on top of the dialog for its whole life.
 //
-// v1.7 adds a caret *frame* around the whole TUI (top row, left column, right column) via
-// `TUI.showOverlay` strips, so the whole screen — not just the rule above the editor — reads as
-// "waiting". Fading the transcript text itself is not possible from an extension: omp rejects a
-// direct `setTheme(ThemeObject)` call, `setHeader`/`setFooter` are no-ops, and the components that
-// paint transcript text have no external seam (verified against omp 18.2.8's
-// `extension-ui-controller.ts`). The frame is the closest attention-grabbing effect reachable from
-// the documented extension surface.
+// v1.8 frames only the last reply: a `v` divider appended to the transcript at assistant
+// `message_start` (see `AskPulseDivider`) plus the `^` rule above the editor. Whole-screen
+// overlays were tried in 1.7 and rejected as visually noisy.
 //
 // Degradation contract:
 //  - RPC/ACP modes only accept string-array widgets, so `setWidget` with a component factory can
@@ -42,10 +38,16 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { homedir } from "node:os"
 import { join } from "node:path"
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@oh-my-pi/pi-coding-agent"
-import type { Component, OverlayHandle, OverlayOptions, TUI } from "@oh-my-pi/pi-tui"
+import type { Component, TUI } from "@oh-my-pi/pi-tui"
 import { stringWidth } from "bun"
 
 const WIDGET_KEY = "ask-pulse"
+/** Second, permanent widget: the only reason to mount it is to get a live `TUI`/`theme` handle
+ * even when the banner itself is unmounted (e.g. between `agent_start` and the next `agent_end`).
+ * Zero rows, so it is layout-neutral in `hookWidgetContainerAbove`. */
+const PROBE_KEY = "ask-pulse-tui"
+/** Shared empty-render result for the probe widget; reference identity signals "unchanged" to pi-tui. */
+const EMPTY_ROWS: readonly string[] = []
 const TITLE = " WAITING FOR YOUR INPUT "
 const CONFIG_BASENAME = "ask-pulse.json"
 
@@ -450,37 +452,6 @@ const FALLBACK_GLYPHS: BoxGlyphs = {
 }
 
 /**
- * A mirrored pair of wave paths, one per side of the screen: top-center → top corner → down that
- * side → along the rule to the text. `total` is the whole path's cell count; `top`/`side`/`rule`
- * are how many of those cells belong to each leg, in path order (index 0 = top-center).
- */
-export interface RingPath {
-  top: number
-  side: number
-  rule: number
-  total: number
-}
-
-/**
- * Geometry shared by the idle rule and the frame strips, so a single rainbow flows continuously
- * from the top-center split point, out to a corner, down a side, and along the rule into the text.
- * `cols`/`rows` are the *screen's* dimensions — for the idle rule alone (no frame mounted) callers
- * pass `rows = 1` and then zero `top` themselves, since there is no strip to traverse.
- */
-export function ringPaths(cols: number, rows: number): { left: RingPath; right: RingPath } {
-  const titleWidth = Math.min(stringWidth(TITLE), cols)
-  const ruleLeft = Math.max(0, Math.floor((cols - titleWidth) / 2))
-  const ruleRight = Math.max(0, cols - titleWidth - ruleLeft)
-  const topLeft = Math.floor(cols / 2)
-  const topRight = cols - topLeft
-  const side = Math.max(0, rows - 1)
-  return {
-    left: { top: topLeft, side, rule: ruleLeft, total: topLeft + side + ruleLeft },
-    right: { top: topRight, side, rule: ruleRight, total: topRight + side + ruleRight },
-  }
-}
-
-/**
  * Rounded box whose border color is recomputed on every render from the wall clock.
  * Wrapped content is cached per width so only the (cheap) paint pass runs per frame.
  */
@@ -489,30 +460,13 @@ export class AskPulseBanner implements Component {
   readonly #glyphs: BoxGlyphs
   readonly #palette: Palette
   readonly #mountedAt = Date.now()
-  readonly #geometry?: () => { cols: number; rows: number }
-  readonly #hideFrame?: () => void
   #cachedWidth = -1
   #cachedBody: string[] = []
 
-  constructor(
-    questions: readonly string[],
-    boxRound: BoxGlyphs,
-    palette: Palette,
-    geometry?: () => { cols: number; rows: number },
-    host?: FrameHost,
-  ) {
+  constructor(questions: readonly string[], boxRound: BoxGlyphs, palette: Palette) {
     this.#questions = questions
     this.#glyphs = boxRound
     this.#palette = palette
-    this.#geometry = geometry
-    if (host !== undefined) {
-      this.#hideFrame = mountFrame(host, { palette, mountedAt: this.#mountedAt, home: null })
-    }
-  }
-
-  /** Tear down the frame strips this banner mounted, if any. Idempotent (delegates to `hide()`). */
-  dispose(): void {
-    this.#hideFrame?.()
   }
 
   /**
@@ -575,42 +529,33 @@ export class AskPulseBanner implements Component {
     // directly above the editor without competing with the response text it follows. v1.6 replaced
     // the uniform horizontal rule with caret runs that a color wave sweeps inward from both edges
     // to the text and back out again; v1.7's rainbow mode instead flows a hue continuously along
-    // the whole frame (see `ringPaths`) into the text, with no bounce and no flip.
+    // the rule into the text, with no bounce and no flip. v1.8: carets point up (`^`) at rest and
+    // flip to point down (`v`) as the wave passes — matching the `v` divider above the last reply.
     if (this.#questions.length === 0) {
-      const rows = this.#geometry?.().rows ?? 1
-      const paths = ringPaths(width, rows)
-      if (this.#geometry === undefined) {
-        // No host-provided screen geometry (legacy call site, or the compile-time preview script):
-        // the rule alone is the whole path, exactly as before v1.7.
-        paths.left.top = 0
-        paths.right.top = 0
-      }
-      const leftTotal = paths.left.top + paths.left.side + paths.left.rule
-      const rightTotal = paths.right.top + paths.right.side + paths.right.rule
-      const left = paths.left.rule
-      const right = paths.right.rule
       const titleWidth = Math.min(stringWidth(TITLE), width)
+      const left = Math.max(0, Math.floor((width - titleWidth) / 2))
+      const right = Math.max(0, width - titleWidth - left)
       const u = (clock % palette.periodMs) / palette.periodMs
       const f = wavefront(u, locked)
       const cells: WaveCell[] = []
       // Locked carets stay unflipped — pointing inward at the text is the resting attention state.
       for (let i = 0; i < left; i++) {
-        if (palette.rainbow) cells.push(rainbowCell(paths.left.top + paths.left.side + i, leftTotal, u, ">"))
-        else if (locked) cells.push({ glyph: ">", color: palette.colorA })
-        else cells.push(waveCell(i, left, f, ">", "<", palette))
+        if (palette.rainbow) cells.push(rainbowCell(i, left, u, "^"))
+        else if (locked) cells.push({ glyph: "^", color: palette.colorA })
+        else cells.push(waveCell(i, left, f, "^", "v", palette))
       }
       for (const glyph of TITLE.slice(0, titleWidth)) {
         cells.push(
           palette.rainbow
-            ? rainbowCell(leftTotal - 1, leftTotal, u, glyph)
+            ? rainbowCell(left - 1, left, u, glyph)
             : { glyph, color: mixColors(palette.colorB, palette.colorA, f) },
         )
       }
       // The right segment mirrors: its outer edge is the *last* column, so `k` counts back from it.
       for (let k = 0; k < right; k++) {
-        if (palette.rainbow) cells.push(rainbowCell(paths.right.top + paths.right.side + k, rightTotal, u, "<"))
-        else if (locked) cells.push({ glyph: "<", color: palette.colorA })
-        else cells.push(waveCell(right - 1 - k, right, f, "<", ">", palette))
+        if (palette.rainbow) cells.push(rainbowCell(k, right, u, "^"))
+        else if (locked) cells.push({ glyph: "^", color: palette.colorA })
+        else cells.push(waveCell(right - 1 - k, right, f, "^", "v", palette))
       }
       return [paintCells(cells)]
     }
@@ -647,151 +592,171 @@ export class AskPulseBanner implements Component {
   }
 }
 
+/** Dim fallback for the resting divider when omp hands the widget factory no theme (jiti installs). */
+const FALLBACK_DIM: RGB = [0x55, 0x55, 0x5f]
+
+/** Resting-state palette for a freshly constructed divider: never rendered (dormant until `activate()`). */
+const REST_PALETTE: Palette = {
+  colorA: FALLBACK_DIM,
+  colorB: FALLBACK_DIM,
+  periodMs: DEFAULT_PERIOD_MS,
+  holdAfterMs: 0,
+  rainbow: false,
+}
+
+/**
+ * Cells of the full-width down-caret line above the last reply: hue flows from both edges toward
+ * the middle, mirroring the rule. The glyph never changes (`v` in both wave states) because a
+ * transcript row that may already be in scrollback must only ever change color, never glyphs.
+ */
+function dividerCells(width: number, u: number, f: number, locked: boolean, palette: Palette): WaveCell[] {
+  const left = Math.floor(width / 2)
+  const right = width - left
+  const cells: WaveCell[] = []
+  for (let c = 0; c < width; c++) {
+    const inLeft = c < left
+    const i = inLeft ? c : width - 1 - c
+    const n = inLeft ? left : right
+    if (palette.rainbow) cells.push(rainbowCell(i, n, u, "v"))
+    else if (locked) cells.push({ glyph: "v", color: palette.colorA })
+    else cells.push(waveCell(i, n, f, "v", "v", palette))
+  }
+  return cells
+}
+
+/**
+ * Full-width `v` divider appended to the transcript at each assistant `message_start`, framing
+ * only the last reply. Dim while the agent works; animates once the turn yields (`activate()`)
+ * and returns to a dim resting line when superseded or cleared (`deactivate()`). Declares itself
+ * a finalized transcript block whose version bumps on every repaint so omp knows not to replay
+ * stale rows instead of the freshly painted ones (`FinalizableBlock` in omp's
+ * `transcript-container.ts`) — an unfinalized block would instead pin the live-region seam open
+ * for the whole turn.
+ */
+export class AskPulseDivider implements Component {
+  readonly #dim: (text: string) => string
+  #palette: Palette = REST_PALETTE
+  #active = false
+  #mountedAt = 0
+  #version = 0
+  #cacheWidth = -1
+  #cacheActive = false
+  #lastClock = -1
+  #cache: readonly string[] = []
+
+  constructor(dim: (text: string) => string) {
+    this.#dim = dim
+  }
+
+  /** Start animating: called when the rule/box mounts. */
+  activate(palette: Palette): void {
+    this.#palette = palette
+    this.#mountedAt = Date.now()
+    this.#active = true
+    this.#version++
+  }
+
+  /** Back to the dim resting line: called from `clear()` and when a newer divider supersedes this one. */
+  deactivate(): void {
+    this.#active = false
+    this.#version++
+  }
+
+  invalidate(): void {
+    this.#cacheWidth = -1
+  }
+
+  /** Always finalized: an unfinalized block would pin the transcript's live-region seam open. */
+  isTranscriptBlockFinalized(): boolean {
+    return true
+  }
+
+  /** omp replays a finalized block's previous rows unless this changes between renders. */
+  getTranscriptBlockVersion(): number {
+    return this.#version
+  }
+
+  render(width: number): readonly string[] {
+    if (width < 1) return []
+    if (!this.#active) {
+      if (this.#cacheWidth !== width || this.#cacheActive) {
+        this.#cache = [this.#dim("v".repeat(width))]
+        this.#cacheWidth = width
+        this.#cacheActive = false
+      }
+      return this.#cache
+    }
+    const palette = this.#palette
+    const locked = palette.holdAfterMs > 0 && Date.now() - this.#mountedAt >= palette.holdAfterMs
+    const clock = locked ? this.#mountedAt + palette.holdAfterMs : Date.now()
+    if (this.#cacheActive && clock === this.#lastClock && width === this.#cacheWidth) return this.#cache
+    const u = (clock % palette.periodMs) / palette.periodMs
+    const f = wavefront(u, locked)
+    this.#cache = [paintCells(dividerCells(width, u, f, locked, palette))]
+    this.#cacheWidth = width
+    this.#cacheActive = true
+    this.#lastClock = clock
+    this.#version++
+    return this.#cache
+  }
+}
+
+/** A transcript component that can host a divider: the shape `findTranscript` returns. */
+export interface TranscriptHost {
+  children: Component[]
+  addChild(component: Component): void
+  removeChild(component: Component): void
+}
+
+/** Duck-typed omp `TranscriptContainer`: the one TUI root child that owns tool-activity visibility. */
+export function findTranscript(root: { children: Component[] }): TranscriptHost | undefined {
+  for (const child of root.children) {
+    const candidate = child as Partial<TranscriptHost> & { setToolActivityVisible?: unknown }
+    if (typeof candidate.setToolActivityVisible === "function" && Array.isArray(candidate.children)) {
+      return child as unknown as TranscriptHost
+    }
+  }
+  return undefined
+}
+
+/**
+ * Whether every row from `divider` down to the bottom of the frame fits in the terminal, i.e. the
+ * divider is still inside the repainted window and may be removed without touching committed
+ * history. `width`/`rows` are the terminal's; heights come from out-of-band `render(width).length`
+ * calls on the reply blocks after the divider and on every TUI root child after the transcript
+ * (all finalized/cached, so this is cheap).
+ */
+export function dividerOnScreen(
+  root: { children: Component[] },
+  transcript: TranscriptHost,
+  divider: Component,
+  width: number,
+  rows: number,
+): boolean {
+  const idx = transcript.children.indexOf(divider)
+  if (idx < 0) return false
+  const rowsOf = (component: Component): number => {
+    try {
+      return component.render(width).length
+    } catch {
+      return rows // a throwing child counts as a full screen, forcing "not on screen"
+    }
+  }
+  let below = 0
+  for (const child of transcript.children.slice(idx + 1)) below += rowsOf(child)
+  const transcriptIdx = root.children.indexOf(transcript as unknown as Component)
+  if (transcriptIdx >= 0) {
+    for (const child of root.children.slice(transcriptIdx + 1)) below += rowsOf(child)
+  }
+  return below + 1 < rows
+}
+
 /** `1800000`, `30m`, `90s`, `2h` → milliseconds. `undefined` when it is not a duration at all. */
 export function parseDuration(raw: string): number | undefined {
   const match = /^(-?\d+(?:\.\d+)?)(ms|s|m|h)?$/i.exec(raw.trim())
   if (match === null) return undefined
   const scale = { ms: 1, s: 1000, m: 60_000, h: 3_600_000 }[match[2]?.toLowerCase() ?? "ms"] ?? 1
   return Number(match[1]) * scale
-}
-
-/**
- * The overlay-hosting surface the frame strips need: real terminal dimensions, focus control, and
- * `showOverlay`. `TUI` satisfies this structurally; tests supply a fake.
- */
-export interface FrameHost {
-  terminal: { columns: number; rows: number }
-  getFocused(): Component | null
-  setFocus(component: Component | null): void
-  showOverlay(component: Component, options?: OverlayOptions): OverlayHandle
-}
-
-/** Mutable state shared by every strip of one mounted frame. */
-interface FrameState {
-  palette: Palette
-  mountedAt: number
-  /** Last legitimately focused non-strip component — where a stray strip focus gets sent back. */
-  home: Component | null
-}
-
-/**
- * One edge of the caret frame: the top row, or a full-height side column. Declares itself an
- * overlay focus-target owner so the editor (or ask dialog) underneath keeps receiving keystrokes
- * while a strip is the topmost overlay, and self-heals focus that a sibling overlay's close
- * handed to a strip instead of back to the real editor.
- */
-export class AskPulseStrip implements Component {
-  readonly #side: "top" | "left" | "right"
-  readonly #host: FrameHost
-  readonly #state: FrameState
-
-  constructor(side: "top" | "left" | "right", host: FrameHost, state: FrameState) {
-    this.#side = side
-    this.#host = host
-    this.#state = state
-  }
-
-  /** Every strip is a pass-through focus owner: the real focus target is always `state.home`. */
-  ownsOverlayFocusTarget(_component: Component): boolean {
-    return true
-  }
-
-  /** Recovers the first keystroke when another overlay's close handed focus to a strip. */
-  handleInput(data: string): void {
-    const home = this.#state.home
-    if (home === null) return
-    this.#host.setFocus(home)
-    home.handleInput?.(data)
-  }
-
-  invalidate(): void {}
-
-  render(_width: number): readonly string[] {
-    // Self-heal focus before painting: a strip must never keep the keyboard. If some other
-    // overlay closed and handed focus to a strip (tui.ts focuses `topVisible.component`), claim it
-    // back for the real editor; otherwise remember whatever legitimately holds focus now.
-    const focused = this.#host.getFocused()
-    if (focused instanceof AskPulseStrip) {
-      if (this.#state.home !== null) this.#host.setFocus(this.#state.home)
-    } else if (focused !== null) {
-      this.#state.home = focused
-    }
-
-    const { palette, mountedAt } = this.#state
-    const locked = palette.holdAfterMs > 0 && Date.now() - mountedAt >= palette.holdAfterMs
-    const clock = locked ? mountedAt + palette.holdAfterMs : Date.now()
-    const u = (clock % palette.periodMs) / palette.periodMs
-    const f = wavefront(u, locked)
-    const paths = ringPaths(this.#host.terminal.columns, this.#host.terminal.rows)
-
-    const cell = (path: RingPath, i: number, normal: string, flipped: string): WaveCell => {
-      if (palette.rainbow) return rainbowCell(i, path.total, u, normal)
-      if (locked) return { glyph: normal, color: palette.colorA }
-      return waveCell(i, path.total, f, normal, flipped, palette)
-    }
-
-    if (this.#side === "top") {
-      const cols = this.#host.terminal.columns
-      const cells: WaveCell[] = []
-      for (let c = 0; c < cols; c++) {
-        if (c < paths.left.top) cells.push(cell(paths.left, paths.left.top - 1 - c, "<", ">"))
-        else cells.push(cell(paths.right, c - paths.left.top, ">", "<"))
-      }
-      return [paintCells(cells)]
-    }
-
-    const path = this.#side === "left" ? paths.left : paths.right
-    const rows: string[] = []
-    for (let r = 0; r < path.side; r++) rows.push(paintCells([cell(path, path.top + r, "v", "^")]))
-    return rows
-  }
-}
-
-/**
- * Mount the three frame strips (top row, left column, right column) as overlays and return a
- * `hide()` that idempotently tears them down and restores focus.
- *
- * `preFocus` (tui.ts) is captured *inside* each `showOverlay` call, so every strip re-focuses
- * `state.home` immediately after mounting — otherwise the second and third strips would each
- * capture the previous strip as their own `preFocus` and hand focus to a sibling strip on close.
- */
-export function mountFrame(host: FrameHost, state: FrameState): () => void {
-  const visible = (w: number, h: number) => w >= MIN_WIDTH && h >= 4
-  state.home = host.getFocused()
-
-  const top = host.showOverlay(new AskPulseStrip("top", host, state), {
-    anchor: "top-left",
-    width: "100%",
-    maxHeight: 1,
-    visible,
-  })
-  if (state.home !== null) host.setFocus(state.home)
-
-  const left = host.showOverlay(new AskPulseStrip("left", host, state), {
-    anchor: "top-left",
-    width: 1,
-    margin: { top: 1 },
-    visible,
-  })
-  if (state.home !== null) host.setFocus(state.home)
-
-  const right = host.showOverlay(new AskPulseStrip("right", host, state), {
-    anchor: "top-right",
-    width: 1,
-    margin: { top: 1 },
-    visible,
-  })
-  if (state.home !== null) host.setFocus(state.home)
-
-  let hidden = false
-  return () => {
-    if (hidden) return // idempotent
-    hidden = true
-    right.hide()
-    left.hide()
-    top.hide()
-    if (state.home !== null) host.setFocus(state.home)
-  }
 }
 
 const USAGE = [
@@ -813,6 +778,8 @@ export default function askPulse(pi: ExtensionAPI) {
   let mounted = false
   let tuiRef: TUI | undefined
   let bannerRef: AskPulseBanner | undefined
+  let dimRef: ((text: string) => string) | undefined
+  let divider: AskPulseDivider | undefined
 
   /** Stop the repaint tick and the hold deadline; the widget itself is left to the caller. */
   const stopTimers = (ctx: ExtensionContext): void => {
@@ -826,7 +793,32 @@ export default function askPulse(pi: ExtensionAPI) {
     }
   }
 
+  /**
+   * Make sure `tuiRef`/`dimRef` are populated even when the banner itself is unmounted — `clear()`
+   * always drops `tuiRef`, but `message_start` needs a live `TUI` to find the transcript between
+   * turns. The probe widget's factory is synchronous, so this resolves inline when a TUI is
+   * available; RPC/ACP surfaces throw on a component-factory widget, swallowed like every other
+   * widget call in this file.
+   */
+  const ensureTui = (ctx: ExtensionContext): void => {
+    if (tuiRef !== undefined) return
+    try {
+      ctx.ui.setWidget(
+        PROBE_KEY,
+        (tui, theme) => {
+          tuiRef = tui
+          dimRef = (text: string) => (theme ? theme.fg("dim", text) : sgr(FALLBACK_DIM, text))
+          return { render: () => EMPTY_ROWS, invalidate() {} }
+        },
+        { placement: "aboveEditor" },
+      )
+    } catch {
+      // Widget surface unavailable — divider orchestration silently no-ops for this turn.
+    }
+  }
+
   const clear = (ctx: ExtensionContext): void => {
+    divider?.deactivate() // keep the reference — retired only by the next assistant `message_start`
     if (!mounted) return // idempotent
     mounted = false
     activeToolCallId = undefined
@@ -849,13 +841,7 @@ export default function askPulse(pi: ExtensionAPI) {
           tuiRef = tui
           // `theme` can be undefined under jiti / dual-module-graph installs (omp issue #5366,
           // the same hazard `dynamic-border.ts` guards). Degrade to glyphs, never crash the TUI.
-          bannerRef = new AskPulseBanner(
-            questions,
-            theme?.boxRound ?? FALLBACK_GLYPHS,
-            palette,
-            () => ({ cols: tui.terminal.columns, rows: tui.terminal.rows }),
-            tui,
-          )
+          bannerRef = new AskPulseBanner(questions, theme?.boxRound ?? FALLBACK_GLYPHS, palette)
           return bannerRef
         },
         { placement: "aboveEditor" },
@@ -864,6 +850,7 @@ export default function askPulse(pi: ExtensionAPI) {
       return false // Component-factory widgets unsupported here; stay a silent no-op.
     }
     mounted = true
+    divider?.activate(palette)
     // The tick only asks for a repaint; the pulse phase comes from the wall clock in render().
     timer = ctx.setInterval(() => tuiRef?.requestRender(), FRAME_MS)
 
@@ -896,6 +883,34 @@ export default function askPulse(pi: ExtensionAPI) {
   // `ask` is concurrency-exclusive, so at most one is ever live — matching on either field is safe.
   pi.on("tool_execution_end", (event, ctx) => {
     if (event.toolCallId === activeToolCallId || event.toolName === "ask") clear(ctx)
+  })
+
+  // A new assistant reply is starting: retire the previous divider (remove it if it never left the
+  // repainted window, else leave it dimmed in scrollback) and append a fresh one above where this
+  // reply is about to render. Relies on the extension's `message_start` handler being awaited
+  // before the TUI subscriber adds the assistant transcript component (`agent-session.ts`
+  // `#emitSessionEvent`) so the divider lands immediately above the reply it is framing.
+  pi.on("message_start", (event, ctx) => {
+    if (event.message.role !== "assistant" || !ctx.hasUI) return
+    if (!loadConfig(ctx.cwd).idle) return
+    try {
+      ensureTui(ctx)
+      const tui = tuiRef
+      if (tui === undefined) return
+      const chat = findTranscript(tui)
+      if (chat === undefined) return
+      if (divider !== undefined && chat.children.includes(divider)) {
+        if (dividerOnScreen(tui, chat, divider, tui.terminal.columns, tui.terminal.rows)) {
+          chat.removeChild(divider)
+        } else {
+          divider.deactivate()
+        }
+      }
+      divider = new AskPulseDivider(dimRef ?? ((text: string) => sgr(FALLBACK_DIM, text)))
+      chat.addChild(divider)
+    } catch {
+      // omp internals moved — silent no-op, matching every other widget call in this file.
+    }
   })
 
   // The agent has yielded the turn: every path back to the user ends here, including a plain

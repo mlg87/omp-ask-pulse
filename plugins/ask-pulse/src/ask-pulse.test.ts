@@ -4,7 +4,6 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, type Mock
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import type { Component } from "@oh-my-pi/pi-tui"
 
 const workspace = mkdtempSync(join(tmpdir(), "ask-pulse-"))
 const agentDir = join(workspace, "agent")
@@ -23,11 +22,11 @@ const {
   parseDuration,
   loadConfig,
   AskPulseBanner,
-  AskPulseStrip,
-  mountFrame,
+  AskPulseDivider,
+  findTranscript,
+  dividerOnScreen,
   mixColors,
   hueToRgb,
-  ringPaths,
 } = await import("./ask-pulse.ts")
 
 const hex = (color: readonly number[]) => `#${color.map((c) => c.toString(16).padStart(2, "0")).join("")}`
@@ -234,20 +233,6 @@ describe("hueToRgb", () => {
   })
 })
 
-describe("ringPaths", () => {
-  test("splits a 40x10 screen into mirrored top/side/rule legs", () => {
-    const { left, right } = ringPaths(40, 10)
-    expect(left).toEqual({ top: 20, side: 9, rule: 8, total: 37 })
-    expect(right).toEqual({ top: 20, side: 9, rule: 8, total: 37 })
-  })
-
-  test("a single-row screen has no side leg, and an odd width splits the top unevenly", () => {
-    const { right } = ringPaths(41, 1)
-    expect(right.top).toBe(21)
-    expect(right.side).toBe(0)
-  })
-})
-
 describe("AskPulseBanner.render", () => {
   const glyphs = {
     topLeft: "╭",
@@ -343,7 +328,7 @@ describe("AskPulseBanner.render", () => {
     expect(only).not.toContain(glyphs.topLeft)
     expect(only).not.toContain(glyphs.topRight)
     expect(only).not.toContain(glyphs.horizontal)
-    expect(only).toMatch(/^[<>]+ WAITING FOR YOUR INPUT [<>]+$/)
+    expect(only).toMatch(/^[\^v]+ WAITING FOR YOUR INPUT [\^v]+$/)
   })
 
   // Width 40 with a 24-column title gives 8 carets per side, so every `q` below is exact.
@@ -369,14 +354,14 @@ describe("AskPulseBanner.render", () => {
     test("sweeps every caret and flips it at the inward turnaround", () => {
       // Half a period: the front has cleared the innermost caret, so the whole line is swept.
       const { text, triplets } = idleAt(BASE + 600)
-      expect(text).toBe(`${"<".repeat(8)} WAITING FOR YOUR INPUT ${">".repeat(8)}`)
+      expect(text).toBe(`${"v".repeat(8)} WAITING FOR YOUR INPUT ${"v".repeat(8)}`)
       expect(triplets.length).toBeGreaterThan(0)
       for (const triplet of triplets) expect(triplet).toEqual([...palette.colorA])
     })
 
     test("rests unswept and inward-pointing at the outward turnaround", () => {
       const { text, triplets } = idleAt(BASE)
-      expect(text).toBe(`${">".repeat(8)} WAITING FOR YOUR INPUT ${"<".repeat(8)}`)
+      expect(text).toBe(`${"^".repeat(8)} WAITING FOR YOUR INPUT ${"^".repeat(8)}`)
       expect(triplets.length).toBeGreaterThan(0)
       for (const triplet of triplets) expect(triplet).toEqual([...palette.colorB])
     })
@@ -388,7 +373,7 @@ describe("AskPulseBanner.render", () => {
 
     test("locks fully swept but unflipped once the hold window elapses", () => {
       const { text, triplets } = idleAt(BASE + 60_000, 60_000)
-      expect(text).toMatch(/^>+ WAITING FOR YOUR INPUT <+$/)
+      expect(text).toMatch(/^\^+ WAITING FOR YOUR INPUT \^+$/)
       expect(triplets.length).toBeGreaterThan(0)
       for (const triplet of triplets) expect(triplet).toEqual([...palette.colorA])
     })
@@ -416,7 +401,7 @@ describe("AskPulseBanner.render", () => {
 
     test("never flips: carets stay pointed inward while the hue flows", () => {
       for (const now of [BASE, BASE + 300, BASE + 900, BASE + 1700]) {
-        expect(idleAt(now).text).toBe(`${">".repeat(8)} WAITING FOR YOUR INPUT ${"<".repeat(8)}`)
+        expect(idleAt(now).text).toBe(`${"^".repeat(8)} WAITING FOR YOUR INPUT ${"^".repeat(8)}`)
       }
     })
 
@@ -491,137 +476,158 @@ describe("AskPulseBanner.render", () => {
   })
 })
 
-describe("AskPulseStrip.render", () => {
-  const palette = {
+describe("AskPulseDivider", () => {
+  const ESC = String.fromCharCode(0x1b)
+  const SGR = new RegExp(`${ESC}\\[[0-9;]*m`, "g")
+  const TRUECOLOR = new RegExp(`${ESC}\\[38;2;(\\d+);(\\d+);(\\d+)m`, "g")
+  const plain = (line: string) => line.replaceAll(SGR, "")
+  const dim = (text: string) => `${ESC}[2m${text}${ESC}[22m`
+  const BASE = 1_200_000
+  const rainbowPalette = {
+    colorB: [0, 0, 0],
+    colorA: [255, 255, 255],
+    periodMs: 1200,
+    holdAfterMs: 0,
+    rainbow: true,
+  } as const
+  const pairPalette = {
     colorB: [0x3d, 0x04, 0x3a],
     colorA: [0xff, 0x10, 0xf0],
     periodMs: 1200,
     holdAfterMs: 0,
     rainbow: false,
   } as const
-  const ESC = String.fromCharCode(0x1b)
-  const SGR = new RegExp(`${ESC}\\[[0-9;]*m`, "g")
-  const plain = (line: string) => line.replaceAll(SGR, "")
-  const fakeHost = () => ({
-    terminal: { columns: 40, rows: 10 },
-    getFocused: () => null,
-    setFocus() {},
-    showOverlay() {
-      throw new Error("frame strips never call showOverlay on themselves")
-    },
-  })
-  const BASE = 1_200_000
   let clock: Mock<() => number>
 
   beforeEach(() => {
     clock = spyOn(Date, "now")
+    clock.mockReturnValue(BASE)
   })
-  afterEach(() => {
-    clock.mockRestore()
+  afterEach(() => clock.mockRestore())
+
+  test("inactive render is a dim full-width v line, cached by reference", () => {
+    const divider = new AskPulseDivider(dim)
+    const first = divider.render(40)
+    expect(plain(first[0] as string)).toBe("v".repeat(40))
+    expect(first[0]).toContain(`${ESC}[2m`)
+    expect(divider.render(40)).toBe(first) // same array reference: pi-tui treats this as "unchanged"
   })
 
-  test("top strip renders one full-width line pointing outward at rest", () => {
-    clock.mockReturnValue(BASE)
-    const strip = new AskPulseStrip("top", fakeHost(), { palette, mountedAt: BASE, home: null })
-    expect(plain(strip.render(40)[0] as string)).toBe(`${"<".repeat(20)}${">".repeat(20)}`)
+  test("isTranscriptBlockFinalized is always true", () => {
+    expect(new AskPulseDivider(dim).isTranscriptBlockFinalized()).toBe(true)
   })
 
-  test("left strip renders one caret per side row, pointing outward at rest", () => {
-    clock.mockReturnValue(BASE)
-    const strip = new AskPulseStrip("left", fakeHost(), { palette, mountedAt: BASE, home: null })
-    expect((strip.render(1) as string[]).map(plain)).toEqual(Array(9).fill("v"))
+  describe("active, rainbow palette", () => {
+    test("stays a full-width v line and never flips", () => {
+      const divider = new AskPulseDivider(dim)
+      divider.activate(rainbowPalette)
+      for (const now of [BASE, BASE + 300, BASE + 600]) {
+        clock.mockReturnValue(now)
+        expect(plain(divider.render(40)[0] as string)).toBe("v".repeat(40))
+      }
+    })
+
+    test("the outermost left cell at u=0 sits at hue 0.5/20", () => {
+      const divider = new AskPulseDivider(dim)
+      divider.activate(rainbowPalette)
+      clock.mockReturnValue(BASE)
+      const triplets = [...(divider.render(40)[0] as string).matchAll(TRUECOLOR)].map((m) => m.slice(1).map(Number))
+      expect(triplets[0]).toEqual([...hueToRgb(0.5 / 20)])
+    })
+
+    test("version bumps across clocks, holds steady across repeats at the same clock", () => {
+      const divider = new AskPulseDivider(dim)
+      divider.activate(rainbowPalette)
+      clock.mockReturnValue(BASE)
+      divider.render(40)
+      const first = divider.getTranscriptBlockVersion()
+      divider.render(40)
+      expect(divider.getTranscriptBlockVersion()).toBe(first)
+      clock.mockReturnValue(BASE + 40)
+      divider.render(40)
+      expect(divider.getTranscriptBlockVersion()).toBeGreaterThan(first)
+    })
   })
 
-  test("half a period later, the top strip and side column have swept and flipped", () => {
-    clock.mockReturnValue(BASE)
-    const host = fakeHost()
-    const state = { palette, mountedAt: BASE, home: null }
-    const top = new AskPulseStrip("top", host, state)
-    const left = new AskPulseStrip("left", host, state)
+  test("pair palette at the half period stays a v line pinned to colorA, never flips", () => {
+    const divider = new AskPulseDivider(dim)
+    divider.activate(pairPalette)
     clock.mockReturnValue(BASE + 600)
-    expect(plain(top.render(40)[0] as string)).toBe(`${">".repeat(20)}${"<".repeat(20)}`)
-    expect((left.render(1) as string[]).map(plain)).toEqual(Array(9).fill("^"))
+    const line = divider.render(40)[0] as string
+    expect(plain(line)).toBe("v".repeat(40))
+    const triplets = [...line.matchAll(TRUECOLOR)].map((m) => m.slice(1).map(Number))
+    expect(triplets.length).toBeGreaterThan(0)
+    for (const triplet of triplets) expect(triplet).toEqual([...pairPalette.colorA])
+  })
+
+  test("deactivate() returns to the dim resting line", () => {
+    const divider = new AskPulseDivider(dim)
+    divider.activate(rainbowPalette)
+    divider.render(40)
+    divider.deactivate()
+    const line = divider.render(40)[0] as string
+    expect(plain(line)).toBe("v".repeat(40))
+    expect(line).toContain(`${ESC}[2m`)
   })
 })
 
-describe("mountFrame", () => {
-  const palette = {
-    colorB: [0, 0, 0],
-    colorA: [255, 255, 255],
-    periodMs: 1200,
-    holdAfterMs: 0,
-    rainbow: false,
-  } as const
+describe("findTranscript", () => {
+  test("returns the root child exposing setToolActivityVisible and a children array", () => {
+    const target = { render: () => [], children: [], setToolActivityVisible() {}, addChild() {}, removeChild() {} }
+    const root = { children: [{ render: () => [] }, target] }
+    expect(findTranscript(root)).toBe(target)
+  })
 
-  const makeHost = () => {
-    const received: string[] = []
-    const home = { handleInput: (data: string) => received.push(data) }
-    const calls: {
-      component: unknown
-      options: { anchor?: string; width?: unknown; maxHeight?: unknown; margin?: unknown; visible?: unknown }
-    }[] = []
-    const setFocusCalls: unknown[] = []
-    const handles: { hidden: boolean; hideCalls: number }[] = []
-    let focused: Component | null = home as unknown as Component
-    const host = {
-      terminal: { columns: 40, rows: 10 },
-      getFocused: () => focused,
-      setFocus(component: Component | null) {
-        focused = component
-        setFocusCalls.push(component)
-      },
-      showOverlay(component: unknown, options: unknown) {
-        calls.push({ component, options: options as never })
-        const handle = {
-          hidden: false,
-          hideCalls: 0,
-          hide() {
-            handle.hidden = true
-            handle.hideCalls++
-          },
-          setHidden(hidden: boolean) {
-            handle.hidden = hidden
-          },
-          isHidden() {
-            return handle.hidden
-          },
-        }
-        handles.push(handle)
-        return handle
-      },
-    }
-    return { host, calls, setFocusCalls, handles, home, received }
+  test("returns undefined when no child matches", () => {
+    const root = { children: [{ render: () => [] }, { render: () => [], children: [] }] }
+    expect(findTranscript(root)).toBeUndefined()
+  })
+})
+
+describe("dividerOnScreen", () => {
+  const rowsBlock = (n: number) => ({ render: () => Array(n).fill("x") })
+  const throwingBlock = {
+    render: () => {
+      throw new Error("boom")
+    },
   }
 
-  test("mounts three strips with the documented anchors and refocuses home after each", () => {
-    const { host, calls, setFocusCalls, home } = makeHost()
-    mountFrame(host, { palette, mountedAt: Date.now(), home: null })
-
-    expect(calls).toHaveLength(3)
-    expect(calls[0]?.options).toMatchObject({ anchor: "top-left", width: "100%", maxHeight: 1 })
-    expect(calls[1]?.options).toMatchObject({ anchor: "top-left", width: 1, margin: { top: 1 } })
-    expect(calls[2]?.options).toMatchObject({ anchor: "top-right", width: 1, margin: { top: 1 } })
-    for (const call of calls) expect(typeof call.options.visible).toBe("function")
-    expect(setFocusCalls).toEqual([home, home, home])
+  test("true when the divider and everything below it fits the terminal", () => {
+    const divider = rowsBlock(1)
+    const transcript = {
+      render: () => [],
+      children: [rowsBlock(5), divider, rowsBlock(10)],
+      addChild() {},
+      removeChild() {},
+    }
+    const root = { children: [transcript, rowsBlock(4)] }
+    expect(dividerOnScreen(root, transcript, divider, 80, 20)).toBe(true) // 10 + 4 + 1 < 20
   })
 
-  test("a strip forwards input to the recovered home and refocuses it", () => {
-    const { host, received } = makeHost()
-    const state = { palette, mountedAt: Date.now(), home: null }
-    mountFrame(host, state)
-    new AskPulseStrip("top", host, state).handleInput("x")
-    expect(received).toEqual(["x"])
+  test("false when the total no longer fits the terminal", () => {
+    const divider = rowsBlock(1)
+    const transcript = {
+      render: () => [],
+      children: [rowsBlock(5), divider, rowsBlock(10)],
+      addChild() {},
+      removeChild() {},
+    }
+    const root = { children: [transcript, rowsBlock(4)] }
+    expect(dividerOnScreen(root, transcript, divider, 80, 15)).toBe(false)
   })
 
-  test("hide() is idempotent: each handle hides exactly once, then focus returns home", () => {
-    const { host, handles, setFocusCalls, home } = makeHost()
-    const hide = mountFrame(host, { palette, mountedAt: Date.now(), home: null })
-    setFocusCalls.length = 0 // clear the three post-mount refocuses
-    hide()
-    hide()
-    expect(handles).toHaveLength(3)
-    for (const handle of handles) expect(handle.hideCalls).toBe(1)
-    expect(setFocusCalls).toEqual([home])
+  test("false when the divider is not in the transcript", () => {
+    const divider = rowsBlock(1)
+    const transcript = { render: () => [], children: [rowsBlock(5)], addChild() {}, removeChild() {} }
+    const root = { children: [transcript] }
+    expect(dividerOnScreen(root, transcript, divider, 80, 20)).toBe(false)
+  })
+
+  test("false when a block after the divider throws while rendering", () => {
+    const divider = rowsBlock(1)
+    const transcript = { render: () => [], children: [divider, throwingBlock], addChild() {}, removeChild() {} }
+    const root = { children: [transcript] }
+    expect(dividerOnScreen(root, transcript, divider, 80, 20)).toBe(false)
   })
 })
 
