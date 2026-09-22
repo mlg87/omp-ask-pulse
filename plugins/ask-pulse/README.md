@@ -49,7 +49,7 @@ the documented surface allows.
 ## Install
 
 ```
-/marketplace add mlg87/omp-ask-pulse
+/marketplace add mlg87/omp-plugins
 /marketplace install ask-pulse@mlg87
 ```
 

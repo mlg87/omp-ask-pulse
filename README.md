@@ -1,9 +1,9 @@
-# mlg87 omp marketplace
+# mlg87 omp plugins
 
 An [omp](https://github.com/oh-my-pi/pi-coding-agent) plugin marketplace.
 
 ```
-/marketplace add mlg87/omp-ask-pulse
+/marketplace add mlg87/omp-plugins
 /marketplace discover mlg87
 ```
 
@@ -26,7 +26,7 @@ Install one:
 ## Local development
 
 ```
-/marketplace add ./omp-ask-pulse
+/marketplace add ./omp-plugins
 /marketplace install --force ask-pulse@mlg87
 ```
 

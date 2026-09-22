@@ -26,8 +26,8 @@
         "notification",
         "extension"
       ],
-      "homepage": "https://github.com/mlg87/omp-ask-pulse",
-      "repository": "https://github.com/mlg87/omp-ask-pulse"
+      "homepage": "https://github.com/mlg87/omp-plugins",
+      "repository": "https://github.com/mlg87/omp-plugins"
     },
     {
       "name": "obvi-plan",
