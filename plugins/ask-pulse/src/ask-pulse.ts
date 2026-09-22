@@ -12,6 +12,14 @@
 // which renders immediately above `editorContainer`; the ask dialog is mounted *into*
 // `editorContainer`. The banner therefore sits directly on top of the dialog for its whole life.
 //
+// v1.7 adds a caret *frame* around the whole TUI (top row, left column, right column) via
+// `TUI.showOverlay` strips, so the whole screen — not just the rule above the editor — reads as
+// "waiting". Fading the transcript text itself is not possible from an extension: omp rejects a
+// direct `setTheme(ThemeObject)` call, `setHeader`/`setFooter` are no-ops, and the components that
+// paint transcript text have no external seam (verified against omp 18.2.8's
+// `extension-ui-controller.ts`). The frame is the closest attention-grabbing effect reachable from
+// the documented extension surface.
+//
 // Degradation contract:
 //  - RPC/ACP modes only accept string-array widgets, so `setWidget` with a component factory can
 //    throw there. Every call is wrapped in try/catch: silent no-op, never an error.
@@ -34,7 +42,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { homedir } from "node:os"
 import { join } from "node:path"
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@oh-my-pi/pi-coding-agent"
-import type { Component, TUI } from "@oh-my-pi/pi-tui"
+import type { Component, OverlayHandle, OverlayOptions, TUI } from "@oh-my-pi/pi-tui"
 import { stringWidth } from "bun"
 
 const WIDGET_KEY = "ask-pulse"
@@ -59,6 +67,9 @@ export type RGB = readonly [number, number, number]
 /**
  * Resolved pulse appearance: the two interpolation endpoints, cycle length, and when to stop.
  * The pulse fades `colorB` (phase 0) → `colorA` (phase 1); the hold lock pins at `colorA`.
+ * v1.7: `rainbow` is the default appearance — a hue that flows along the frame toward the text
+ * instead of fading between two fixed endpoints. `colorA`/`colorB` stay resolved even in rainbow
+ * mode so switching back with `/ask-pulse color <a> [b]` needs no re-derivation.
  */
 interface Palette {
   colorB: RGB
@@ -70,6 +81,8 @@ interface Palette {
    * state is just as visible as the pulse once you finally look at the screen. `<= 0` never locks.
    */
   holdAfterMs: number
+  /** v1.7: hue flows along the frame toward the text instead of fading between colorA/colorB. */
+  rainbow: boolean
 }
 
 // v1.5: the pulse fades between two configurable colors; these are the omp-logo pink/cyan pair.
@@ -126,6 +139,35 @@ function toHex(color: RGB): string {
   return `#${color.map((c) => c.toString(16).padStart(2, "0")).join("")}`
 }
 
+/** [0,1) → clamped [0,1), wrapping negative and ≥1 inputs. */
+function mod1(x: number): number {
+  return ((x % 1) + 1) % 1
+}
+
+/**
+ * HSV → RGB with S = V = 1, so every hue is a fully-saturated, fully-bright primary/secondary —
+ * the "rainbow" the frame flows through. `h` wraps, so `hueToRgb(1) === hueToRgb(0)`.
+ */
+export function hueToRgb(h: number): RGB {
+  const scaled = mod1(h) * 6
+  const sector = Math.floor(scaled) % 6
+  const x = Math.round(255 * (1 - Math.abs((scaled % 2) - 1)))
+  switch (sector) {
+    case 0:
+      return [255, x, 0]
+    case 1:
+      return [x, 255, 0]
+    case 2:
+      return [0, 255, x]
+    case 3:
+      return [0, x, 255]
+    case 4:
+      return [x, 0, 255]
+    default:
+      return [255, 0, x]
+  }
+}
+
 /** The active profile's agent directory — `PI_CODING_AGENT_DIR` wins, matching omp's own resolution. */
 const AGENT_DIR = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".omp", "agent")
 const USER_CONFIG_PATH = join(AGENT_DIR, CONFIG_BASENAME)
@@ -170,11 +212,21 @@ export function loadConfig(cwd: string): PulseConfig {
   let periodMs = DEFAULT_PERIOD_MS
   let idle = true
   let holdAfterMs = DEFAULT_HOLD_AFTER_MS
+  // v1.7: rainbow is the new built-in default; any source that resolves a `color` switches to the
+  // two-color pair, and a later source spelling `color: "rainbow"` switches back.
+  let rainbow = true
   for (const source of sources) {
-    const a = parseColor(source.color)
-    if (a !== undefined) {
-      colorA = a
-      colorASet = true
+    const rawColor = typeof source.color === "string" ? source.color.trim().toLowerCase() : undefined
+    if (rawColor === "rainbow") {
+      rainbow = true
+      colorASet = false
+    } else {
+      const a = parseColor(source.color)
+      if (a !== undefined) {
+        colorA = a
+        colorASet = true
+        rainbow = false
+      }
     }
     const b = parseColor(source.color2)
     if (b !== undefined) colorB = b
@@ -191,7 +243,7 @@ export function loadConfig(cwd: string): PulseConfig {
   }
   // Only `color` set → keep the pre-v1.5 look (color ⇄ its own dim). Nothing set → the pink/cyan pair.
   const resolvedB = colorB ?? (colorASet ? deriveDim(colorA) : DEFAULT_COLOR_B)
-  return { palette: { colorB: resolvedB, colorA, periodMs, holdAfterMs }, idle }
+  return { palette: { colorB: resolvedB, colorA, periodMs, holdAfterMs, rainbow }, idle }
 }
 
 /** Persist a partial config to the user file, preserving unrelated keys. */
@@ -265,38 +317,45 @@ function sgr(color: RGB, text: string): string {
   return `\x1b[38;2;${color[0]};${color[1]};${color[2]}m${text}\x1b[39m`
 }
 
-/** Perceptual interpolation between the two endpoints, emitted as a truecolor SGR pair. */
-function paint(text: string, t: number, palette: Palette): string {
-  return sgr(mixColors(palette.colorB, palette.colorA, t), text)
-}
-
-/** One column of the idle caret wave: the glyph to draw and its position on the colorB→colorA ramp. */
+/** One column of a caret wave: the glyph to draw and its resolved color for this frame. */
 interface WaveCell {
   glyph: string
-  t: number
+  color: RGB
 }
 
 /**
- * Color ramp and flip state for the caret `i` steps in from its segment's *outer* edge (v1.6).
+ * Pair-mode color ramp and flip state for the caret `i` steps in from its segment's *outer* edge
+ * (v1.6), generalized to any segment length `n` (v1.7: `n` is a whole ring-path length for the
+ * frame strips, or just the rule length for the idle rule).
  *
  * The wave front `f` advances in the same normalised space as `q`, so a caret behind the front is
  * fully `colorA`, one ahead of it fully `colorB`, and the {@link WAVE_SOFTNESS} band between them
  * is smoothstepped — a linear band leaves a visible crease at the front on a dark terminal. The
  * glyph flips at the band's midpoint, which is where the color visibly changes over.
  */
-function waveCell(i: number, n: number, f: number, normal: string, flipped: string): WaveCell {
+function waveCell(i: number, n: number, f: number, normal: string, flipped: string, palette: Palette): WaveCell {
   const q = (i + 0.5) / n
   const raw = Math.min(1, Math.max(0, (f - q + WAVE_SOFTNESS) / (2 * WAVE_SOFTNESS)))
-  return { glyph: raw >= 0.5 ? flipped : normal, t: raw * raw * (3 - 2 * raw) }
+  const t = raw * raw * (3 - 2 * raw)
+  return { glyph: raw >= 0.5 ? flipped : normal, color: mixColors(palette.colorB, palette.colorA, t) }
+}
+
+/**
+ * Rainbow-mode cell: hue depends only on position `i` along a path of length `n` and the moving
+ * phase `u` (both in `[0, 1)`), so as `u` grows the hue at a fixed `i` cycles while a fixed hue
+ * moves toward increasing `i` — i.e. toward the text. Never flips: the resting attention state in
+ * rainbow mode is a steady flow, not a bounce.
+ */
+function rainbowCell(i: number, n: number, u: number, glyph: string): WaveCell {
+  return { glyph, color: hueToRgb((i + 0.5) / n - u) }
 }
 
 /** Concatenate cells, emitting one SGR pair per maximal same-color run rather than per glyph. */
-function paintCells(cells: readonly WaveCell[], palette: Palette): string {
+function paintCells(cells: readonly WaveCell[]): string {
   let out = ""
   let run = ""
   let runColor: RGB = [-1, -1, -1]
-  for (const { glyph, t } of cells) {
-    const color = mixColors(palette.colorB, palette.colorA, t)
+  for (const { glyph, color } of cells) {
     if (color[0] !== runColor[0] || color[1] !== runColor[1] || color[2] !== runColor[2]) {
       if (run !== "") out += sgr(runColor, run)
       run = ""
@@ -305,6 +364,16 @@ function paintCells(cells: readonly WaveCell[], palette: Palette): string {
     run += glyph
   }
   return run === "" ? out : out + sgr(runColor, run)
+}
+
+/**
+ * Cosine ping-pong front position: sweeps edges→text over the first half period and back over the
+ * second, with zero velocity at both turnarounds so the bounce reads as a bounce, not a snap. The
+ * range overshoots `[0, 1]` by one softness half-width at each end so the extremes are fully swept
+ * / fully reset instead of frozen mid-blend. Locked: parked past the text.
+ */
+function wavefront(u: number, locked: boolean): number {
+  return locked ? 1 : -WAVE_SOFTNESS + (1 + 2 * WAVE_SOFTNESS) * ((1 - Math.cos(2 * Math.PI * u)) / 2)
 }
 
 /** Sine pulse in [0, 1] derived from wall-clock time so frames stay smooth regardless of tick jitter. */
@@ -381,6 +450,37 @@ const FALLBACK_GLYPHS: BoxGlyphs = {
 }
 
 /**
+ * A mirrored pair of wave paths, one per side of the screen: top-center → top corner → down that
+ * side → along the rule to the text. `total` is the whole path's cell count; `top`/`side`/`rule`
+ * are how many of those cells belong to each leg, in path order (index 0 = top-center).
+ */
+export interface RingPath {
+  top: number
+  side: number
+  rule: number
+  total: number
+}
+
+/**
+ * Geometry shared by the idle rule and the frame strips, so a single rainbow flows continuously
+ * from the top-center split point, out to a corner, down a side, and along the rule into the text.
+ * `cols`/`rows` are the *screen's* dimensions — for the idle rule alone (no frame mounted) callers
+ * pass `rows = 1` and then zero `top` themselves, since there is no strip to traverse.
+ */
+export function ringPaths(cols: number, rows: number): { left: RingPath; right: RingPath } {
+  const titleWidth = Math.min(stringWidth(TITLE), cols)
+  const ruleLeft = Math.max(0, Math.floor((cols - titleWidth) / 2))
+  const ruleRight = Math.max(0, cols - titleWidth - ruleLeft)
+  const topLeft = Math.floor(cols / 2)
+  const topRight = cols - topLeft
+  const side = Math.max(0, rows - 1)
+  return {
+    left: { top: topLeft, side, rule: ruleLeft, total: topLeft + side + ruleLeft },
+    right: { top: topRight, side, rule: ruleRight, total: topRight + side + ruleRight },
+  }
+}
+
+/**
  * Rounded box whose border color is recomputed on every render from the wall clock.
  * Wrapped content is cached per width so only the (cheap) paint pass runs per frame.
  */
@@ -389,13 +489,30 @@ export class AskPulseBanner implements Component {
   readonly #glyphs: BoxGlyphs
   readonly #palette: Palette
   readonly #mountedAt = Date.now()
+  readonly #geometry?: () => { cols: number; rows: number }
+  readonly #hideFrame?: () => void
   #cachedWidth = -1
   #cachedBody: string[] = []
 
-  constructor(questions: readonly string[], boxRound: BoxGlyphs, palette: Palette) {
+  constructor(
+    questions: readonly string[],
+    boxRound: BoxGlyphs,
+    palette: Palette,
+    geometry?: () => { cols: number; rows: number },
+    host?: FrameHost,
+  ) {
     this.#questions = questions
     this.#glyphs = boxRound
     this.#palette = palette
+    this.#geometry = geometry
+    if (host !== undefined) {
+      this.#hideFrame = mountFrame(host, { palette, mountedAt: this.#mountedAt, home: null })
+    }
+  }
+
+  /** Tear down the frame strips this banner mounted, if any. Idempotent (delegates to `hide()`). */
+  dispose(): void {
+    this.#hideFrame?.()
   }
 
   /**
@@ -405,6 +522,14 @@ export class AskPulseBanner implements Component {
   #locked(): boolean {
     const { holdAfterMs } = this.#palette
     return holdAfterMs > 0 && Date.now() - this.#mountedAt >= holdAfterMs
+  }
+
+  /**
+   * The wall clock this frame animates from — frozen at the lock instant once locked, so a locked
+   * rainbow reads as a static gradient rather than snapping to a single hue.
+   */
+  #clock(): number {
+    return this.#locked() ? this.#mountedAt + this.#palette.holdAfterMs : Date.now()
   }
 
   /** Box-mode phase for this frame, or a hard 1 once the hold window has elapsed. */
@@ -436,33 +561,58 @@ export class AskPulseBanner implements Component {
 
   render(width: number): readonly string[] {
     const palette = this.#palette
+    const locked = this.#locked()
+    const clock = this.#clock()
+    const hue = mod1(1 - (clock % palette.periodMs) / palette.periodMs)
+
     // Degenerate terminals must not crash the render loop.
-    if (width < MIN_WIDTH) return [paint(TITLE.trim(), this.#phase(), palette)]
+    if (width < MIN_WIDTH) {
+      const color = palette.rainbow ? hueToRgb(hue) : mixColors(palette.colorB, palette.colorA, this.#phase())
+      return [sgr(color, TITLE.trim())]
+    }
 
     // Idle mode: no questions to show, so the banner collapses to a single titled rule that sits
-    // directly above the editor without competing with the response text it follows. v1.6 replaces
+    // directly above the editor without competing with the response text it follows. v1.6 replaced
     // the uniform horizontal rule with caret runs that a color wave sweeps inward from both edges
-    // to the text and back out again, each caret flipping to point *with* the wave as it passes.
+    // to the text and back out again; v1.7's rainbow mode instead flows a hue continuously along
+    // the whole frame (see `ringPaths`) into the text, with no bounce and no flip.
     if (this.#questions.length === 0) {
+      const rows = this.#geometry?.().rows ?? 1
+      const paths = ringPaths(width, rows)
+      if (this.#geometry === undefined) {
+        // No host-provided screen geometry (legacy call site, or the compile-time preview script):
+        // the rule alone is the whole path, exactly as before v1.7.
+        paths.left.top = 0
+        paths.right.top = 0
+      }
+      const leftTotal = paths.left.top + paths.left.side + paths.left.rule
+      const rightTotal = paths.right.top + paths.right.side + paths.right.rule
+      const left = paths.left.rule
+      const right = paths.right.rule
       const titleWidth = Math.min(stringWidth(TITLE), width)
-      const left = Math.max(0, Math.floor((width - titleWidth) / 2))
-      const right = Math.max(0, width - titleWidth - left)
-      const locked = this.#locked()
-      // Cosine ping-pong: the front runs edges→text over the first half period and back over the
-      // second, with zero velocity at both turnarounds so the bounce reads as a bounce, not a snap.
-      // The range overshoots [0, 1] by one softness half-width at each end so the extremes are
-      // fully swept / fully reset instead of frozen mid-blend. Locked: front parked past the text.
-      const u = (Date.now() % this.#palette.periodMs) / this.#palette.periodMs
-      const f = locked ? 1 : -WAVE_SOFTNESS + (1 + 2 * WAVE_SOFTNESS) * ((1 - Math.cos(2 * Math.PI * u)) / 2)
+      const u = (clock % palette.periodMs) / palette.periodMs
+      const f = wavefront(u, locked)
       const cells: WaveCell[] = []
       // Locked carets stay unflipped — pointing inward at the text is the resting attention state.
-      for (let i = 0; i < left; i++) cells.push(locked ? { glyph: ">", t: 1 } : waveCell(i, left, f, ">", "<"))
-      for (const glyph of TITLE.slice(0, titleWidth)) cells.push({ glyph, t: f })
-      // The right segment mirrors: its outer edge is the *last* column, so `i` counts back from it.
-      for (let k = 0; k < right; k++) {
-        cells.push(locked ? { glyph: "<", t: 1 } : waveCell(right - 1 - k, right, f, "<", ">"))
+      for (let i = 0; i < left; i++) {
+        if (palette.rainbow) cells.push(rainbowCell(paths.left.top + paths.left.side + i, leftTotal, u, ">"))
+        else if (locked) cells.push({ glyph: ">", color: palette.colorA })
+        else cells.push(waveCell(i, left, f, ">", "<", palette))
       }
-      return [paintCells(cells, palette)]
+      for (const glyph of TITLE.slice(0, titleWidth)) {
+        cells.push(
+          palette.rainbow
+            ? rainbowCell(leftTotal - 1, leftTotal, u, glyph)
+            : { glyph, color: mixColors(palette.colorB, palette.colorA, f) },
+        )
+      }
+      // The right segment mirrors: its outer edge is the *last* column, so `k` counts back from it.
+      for (let k = 0; k < right; k++) {
+        if (palette.rainbow) cells.push(rainbowCell(paths.right.top + paths.right.side + k, rightTotal, u, "<"))
+        else if (locked) cells.push({ glyph: "<", color: palette.colorA })
+        else cells.push(waveCell(right - 1 - k, right, f, "<", ">", palette))
+      }
+      return [paintCells(cells)]
     }
 
     const t = this.#phase()
@@ -475,21 +625,24 @@ export class AskPulseBanner implements Component {
     const title = TITLE.slice(0, titleWidth)
     const leftRule = Math.max(0, Math.floor((ruleWidth - titleWidth) / 2))
     const rightRule = Math.max(0, ruleWidth - titleWidth - leftRule)
-    const top = paint(
+    const borderColor = palette.rainbow ? hueToRgb(hue) : mixColors(palette.colorB, palette.colorA, t)
+    const top = sgr(
+      borderColor,
       `${topLeft}${horizontal.repeat(leftRule)}${title}${horizontal.repeat(rightRule)}${topRight}`,
-      t,
-      palette,
     )
 
-    const bar = paint(vertical, t, palette)
+    const bar = sgr(borderColor, vertical)
     const lines: string[] = [top]
+    // Title text stays readable: rainbow tints toward white; pair mode floors the phase at the
+    // midpoint (and, for a dim-derived palette, keeps the old readability guarantee).
+    const textColor = palette.rainbow
+      ? mixColors(hueToRgb(hue), [0xff, 0xff, 0xff], 0.35)
+      : mixColors(palette.colorB, palette.colorA, Math.max(0.5, t))
     for (const line of this.#body(innerWidth)) {
       const pad = Math.max(0, innerWidth - stringWidth(line))
-      // Title text stays readable: floor the phase at the midpoint so it biases toward `colorA`
-      // (and, for a dim-derived palette, keeps the old readability guarantee).
-      lines.push(`${bar} ${paint(line, Math.max(0.5, t), palette)}${" ".repeat(pad)} ${bar}`)
+      lines.push(`${bar} ${sgr(textColor, line)}${" ".repeat(pad)} ${bar}`)
     }
-    lines.push(paint(`${bottomLeft}${horizontal.repeat(ruleWidth)}${bottomRight}`, t, palette))
+    lines.push(sgr(borderColor, `${bottomLeft}${horizontal.repeat(ruleWidth)}${bottomRight}`))
     return lines
   }
 }
@@ -502,9 +655,148 @@ export function parseDuration(raw: string): number | undefined {
   return Number(match[1]) * scale
 }
 
+/**
+ * The overlay-hosting surface the frame strips need: real terminal dimensions, focus control, and
+ * `showOverlay`. `TUI` satisfies this structurally; tests supply a fake.
+ */
+export interface FrameHost {
+  terminal: { columns: number; rows: number }
+  getFocused(): Component | null
+  setFocus(component: Component | null): void
+  showOverlay(component: Component, options?: OverlayOptions): OverlayHandle
+}
+
+/** Mutable state shared by every strip of one mounted frame. */
+interface FrameState {
+  palette: Palette
+  mountedAt: number
+  /** Last legitimately focused non-strip component — where a stray strip focus gets sent back. */
+  home: Component | null
+}
+
+/**
+ * One edge of the caret frame: the top row, or a full-height side column. Declares itself an
+ * overlay focus-target owner so the editor (or ask dialog) underneath keeps receiving keystrokes
+ * while a strip is the topmost overlay, and self-heals focus that a sibling overlay's close
+ * handed to a strip instead of back to the real editor.
+ */
+export class AskPulseStrip implements Component {
+  readonly #side: "top" | "left" | "right"
+  readonly #host: FrameHost
+  readonly #state: FrameState
+
+  constructor(side: "top" | "left" | "right", host: FrameHost, state: FrameState) {
+    this.#side = side
+    this.#host = host
+    this.#state = state
+  }
+
+  /** Every strip is a pass-through focus owner: the real focus target is always `state.home`. */
+  ownsOverlayFocusTarget(_component: Component): boolean {
+    return true
+  }
+
+  /** Recovers the first keystroke when another overlay's close handed focus to a strip. */
+  handleInput(data: string): void {
+    const home = this.#state.home
+    if (home === null) return
+    this.#host.setFocus(home)
+    home.handleInput?.(data)
+  }
+
+  invalidate(): void {}
+
+  render(_width: number): readonly string[] {
+    // Self-heal focus before painting: a strip must never keep the keyboard. If some other
+    // overlay closed and handed focus to a strip (tui.ts focuses `topVisible.component`), claim it
+    // back for the real editor; otherwise remember whatever legitimately holds focus now.
+    const focused = this.#host.getFocused()
+    if (focused instanceof AskPulseStrip) {
+      if (this.#state.home !== null) this.#host.setFocus(this.#state.home)
+    } else if (focused !== null) {
+      this.#state.home = focused
+    }
+
+    const { palette, mountedAt } = this.#state
+    const locked = palette.holdAfterMs > 0 && Date.now() - mountedAt >= palette.holdAfterMs
+    const clock = locked ? mountedAt + palette.holdAfterMs : Date.now()
+    const u = (clock % palette.periodMs) / palette.periodMs
+    const f = wavefront(u, locked)
+    const paths = ringPaths(this.#host.terminal.columns, this.#host.terminal.rows)
+
+    const cell = (path: RingPath, i: number, normal: string, flipped: string): WaveCell => {
+      if (palette.rainbow) return rainbowCell(i, path.total, u, normal)
+      if (locked) return { glyph: normal, color: palette.colorA }
+      return waveCell(i, path.total, f, normal, flipped, palette)
+    }
+
+    if (this.#side === "top") {
+      const cols = this.#host.terminal.columns
+      const cells: WaveCell[] = []
+      for (let c = 0; c < cols; c++) {
+        if (c < paths.left.top) cells.push(cell(paths.left, paths.left.top - 1 - c, "<", ">"))
+        else cells.push(cell(paths.right, c - paths.left.top, ">", "<"))
+      }
+      return [paintCells(cells)]
+    }
+
+    const path = this.#side === "left" ? paths.left : paths.right
+    const rows: string[] = []
+    for (let r = 0; r < path.side; r++) rows.push(paintCells([cell(path, path.top + r, "v", "^")]))
+    return rows
+  }
+}
+
+/**
+ * Mount the three frame strips (top row, left column, right column) as overlays and return a
+ * `hide()` that idempotently tears them down and restores focus.
+ *
+ * `preFocus` (tui.ts) is captured *inside* each `showOverlay` call, so every strip re-focuses
+ * `state.home` immediately after mounting — otherwise the second and third strips would each
+ * capture the previous strip as their own `preFocus` and hand focus to a sibling strip on close.
+ */
+export function mountFrame(host: FrameHost, state: FrameState): () => void {
+  const visible = (w: number, h: number) => w >= MIN_WIDTH && h >= 4
+  state.home = host.getFocused()
+
+  const top = host.showOverlay(new AskPulseStrip("top", host, state), {
+    anchor: "top-left",
+    width: "100%",
+    maxHeight: 1,
+    visible,
+  })
+  if (state.home !== null) host.setFocus(state.home)
+
+  const left = host.showOverlay(new AskPulseStrip("left", host, state), {
+    anchor: "top-left",
+    width: 1,
+    margin: { top: 1 },
+    visible,
+  })
+  if (state.home !== null) host.setFocus(state.home)
+
+  const right = host.showOverlay(new AskPulseStrip("right", host, state), {
+    anchor: "top-right",
+    width: 1,
+    margin: { top: 1 },
+    visible,
+  })
+  if (state.home !== null) host.setFocus(state.home)
+
+  let hidden = false
+  return () => {
+    if (hidden) return // idempotent
+    hidden = true
+    right.hide()
+    left.hide()
+    top.hide()
+    if (state.home !== null) host.setFocus(state.home)
+  }
+}
+
 const USAGE = [
   "/ask-pulse show — print the active palette and where it came from",
-  "/ask-pulse color <first> [second] — set the fade endpoints; one color pulses against its own dim",
+  "/ask-pulse color <first> [second] | rainbow — set the fade endpoints, or flow a rainbow (default)",
   "/ask-pulse period <ms> — set the pulse cycle length (min 100)",
   "/ask-pulse idle <on|off> — pulse a rule above the editor whenever the agent yields the turn",
   "/ask-pulse hold <30m|0> — lock bright and stop animating after this long; 0 never locks",
@@ -520,6 +812,7 @@ export default function askPulse(pi: ExtensionAPI) {
   let holdTimer: Timer | undefined
   let mounted = false
   let tuiRef: TUI | undefined
+  let bannerRef: AskPulseBanner | undefined
 
   /** Stop the repaint tick and the hold deadline; the widget itself is left to the caller. */
   const stopTimers = (ctx: ExtensionContext): void => {
@@ -538,6 +831,7 @@ export default function askPulse(pi: ExtensionAPI) {
     mounted = false
     activeToolCallId = undefined
     tuiRef = undefined
+    bannerRef = undefined
     stopTimers(ctx)
     try {
       ctx.ui.setWidget(WIDGET_KEY, undefined)
@@ -555,7 +849,14 @@ export default function askPulse(pi: ExtensionAPI) {
           tuiRef = tui
           // `theme` can be undefined under jiti / dual-module-graph installs (omp issue #5366,
           // the same hazard `dynamic-border.ts` guards). Degrade to glyphs, never crash the TUI.
-          return new AskPulseBanner(questions, theme?.boxRound ?? FALLBACK_GLYPHS, palette)
+          bannerRef = new AskPulseBanner(
+            questions,
+            theme?.boxRound ?? FALLBACK_GLYPHS,
+            palette,
+            () => ({ cols: tui.terminal.columns, rows: tui.terminal.rows }),
+            tui,
+          )
+          return bannerRef
         },
         { placement: "aboveEditor" },
       )
@@ -626,8 +927,9 @@ export default function askPulse(pi: ExtensionAPI) {
             process.env.ASK_PULSE_COLOR !== undefined ? `env: ASK_PULSE_COLOR` : undefined,
             process.env.ASK_PULSE_COLOR2 !== undefined ? `env: ASK_PULSE_COLOR2` : undefined,
           ].filter(Boolean)
+          const appearance = palette.rainbow ? "rainbow" : `${toHex(palette.colorA)} ⇄ ${toHex(palette.colorB)}`
           ctx.ui.notify(
-            `ask-pulse ${toHex(palette.colorA)} ⇄ ${toHex(palette.colorB)} @ ${palette.periodMs}ms, idle ${idle ? "on" : "off"}, hold ${palette.holdAfterMs > 0 ? `${palette.holdAfterMs}ms` : "never"}` +
+            `ask-pulse ${appearance} @ ${palette.periodMs}ms, idle ${idle ? "on" : "off"}, hold ${palette.holdAfterMs > 0 ? `${palette.holdAfterMs}ms` : "never"}` +
               (origins.length > 0 ? ` (${origins.join(", ")})` : " (defaults)"),
           )
           return
@@ -655,9 +957,18 @@ export default function askPulse(pi: ExtensionAPI) {
         case "color": {
           if (rest.length === 0 || rest.length > 2) {
             ctx.ui.notify(
-              `Usage: /ask-pulse color <first> [second] — hex or preset (${Object.keys(PRESETS).join(" ")})`,
+              `Usage: /ask-pulse color <first> [second] | rainbow — hex, preset (${Object.keys(PRESETS).join(" ")}), or "rainbow"`,
               "error",
             )
+            return
+          }
+          if (rest[0]?.toLowerCase() === "rainbow") {
+            if (rest.length > 1) {
+              ctx.ui.notify(`"rainbow" does not take a second color (got "${value}")`, "error")
+              return
+            }
+            const path = writeUserConfig({ color: "rainbow", color2: undefined })
+            ctx.ui.notify(`ask-pulse color → rainbow (${path})`)
             return
           }
           const parsed: RGB[] = []
@@ -665,7 +976,7 @@ export default function askPulse(pi: ExtensionAPI) {
             const color = parseColor(token)
             if (color === undefined) {
               ctx.ui.notify(
-                `Unrecognized color "${token}". Use a hex value or: ${Object.keys(PRESETS).join(", ")}`,
+                `Unrecognized color "${token}". Use a hex value, "rainbow", or: ${Object.keys(PRESETS).join(", ")}`,
                 "error",
               )
               return
@@ -696,7 +1007,8 @@ export default function askPulse(pi: ExtensionAPI) {
         case "preview": {
           if (!ctx.hasUI) return
           clear(ctx)
-          const label = `Preview — ${toHex(palette.colorA)} ⇄ ${toHex(palette.colorB)} @ ${palette.periodMs}ms`
+          const appearance = palette.rainbow ? "rainbow" : `${toHex(palette.colorA)} ⇄ ${toHex(palette.colorB)}`
+          const label = `Preview — ${appearance} @ ${palette.periodMs}ms`
           if (!mount(ctx, [label], palette)) return
           // No real ask is in flight, so nothing else will tear this down.
           ctx.setTimeout(() => clear(ctx), PREVIEW_MS)
@@ -704,9 +1016,7 @@ export default function askPulse(pi: ExtensionAPI) {
         }
         case "reset": {
           if (existsSync(USER_CONFIG_PATH)) rmSync(USER_CONFIG_PATH)
-          ctx.ui.notify(
-            `ask-pulse reset to ${toHex(DEFAULT_COLOR_A)} ⇄ ${toHex(DEFAULT_COLOR_B)} @ ${DEFAULT_PERIOD_MS}ms`,
-          )
+          ctx.ui.notify(`ask-pulse reset to rainbow @ ${DEFAULT_PERIOD_MS}ms`)
           return
         }
         default:

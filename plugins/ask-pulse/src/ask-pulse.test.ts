@@ -4,6 +4,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, type Mock
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import type { Component } from "@oh-my-pi/pi-tui"
 
 const workspace = mkdtempSync(join(tmpdir(), "ask-pulse-"))
 const agentDir = join(workspace, "agent")
@@ -16,7 +17,18 @@ delete process.env.ASK_PULSE_COLOR2
 delete process.env.ASK_PULSE_PERIOD_MS
 
 // Dynamic: the module reads PI_CODING_AGENT_DIR at init, which the lines above must win.
-const { parseColor, deriveDim, parseDuration, loadConfig, AskPulseBanner, mixColors } = await import("./ask-pulse.ts")
+const {
+  parseColor,
+  deriveDim,
+  parseDuration,
+  loadConfig,
+  AskPulseBanner,
+  AskPulseStrip,
+  mountFrame,
+  mixColors,
+  hueToRgb,
+  ringPaths,
+} = await import("./ask-pulse.ts")
 
 const hex = (color: readonly number[]) => `#${color.map((c) => c.toString(16).padStart(2, "0")).join("")}`
 const userConfig = join(agentDir, "ask-pulse.json")
@@ -100,10 +112,9 @@ describe("loadConfig precedence", () => {
     rmSync(projectConfig, { force: true })
   })
 
-  test("falls back to the built-in pink ⇄ cyan pair", () => {
+  test("defaults to a rainbow flow (v1.7)", () => {
     const palette = loadConfig(projectDir).palette
-    expect(hex(palette.colorA)).toBe("#ff10f0")
-    expect(hex(palette.colorB)).toBe("#0af0ff")
+    expect(palette.rainbow).toBe(true)
     expect(palette.periodMs).toBe(2000) // v1.6 slowed the default cycle for a smoother fade
   })
 
@@ -161,6 +172,26 @@ describe("loadConfig precedence", () => {
     const palette = loadConfig(projectDir).palette
     expect(hex(palette.colorB)).toBe(hex(deriveDim([0x39, 0xff, 0x14])))
   })
+  test("a resolved color switches off rainbow mode", () => {
+    rmSync(userConfig, { force: true })
+    writeFileSync(projectConfig, JSON.stringify({ color: "green" }))
+    expect(loadConfig(projectDir).palette.rainbow).toBe(false)
+    rmSync(projectConfig, { force: true })
+  })
+
+  test("a later source's explicit color beats an earlier source's rainbow", () => {
+    writeFileSync(userConfig, JSON.stringify({ color: "rainbow" }))
+    writeFileSync(projectConfig, JSON.stringify({ color: "cyan" }))
+    expect(loadConfig(projectDir).palette.rainbow).toBe(false)
+    rmSync(projectConfig, { force: true })
+  })
+
+  test("the environment can restore rainbow mode over a file color", () => {
+    writeFileSync(userConfig, JSON.stringify({ color: "green" }))
+    process.env.ASK_PULSE_COLOR = "rainbow"
+    expect(loadConfig(projectDir).palette.rainbow).toBe(true)
+    delete process.env.ASK_PULSE_COLOR
+  })
 })
 
 describe("loadConfig idle toggle", () => {
@@ -191,6 +222,32 @@ describe("loadConfig idle toggle", () => {
   })
 })
 
+describe("hueToRgb", () => {
+  test("hits the three primaries exactly", () => {
+    expect(hueToRgb(0)).toEqual([255, 0, 0])
+    expect(hueToRgb(1 / 3)).toEqual([0, 255, 0])
+    expect(hueToRgb(2 / 3)).toEqual([0, 0, 255])
+  })
+
+  test("wraps at 1", () => {
+    expect(hueToRgb(1)).toEqual(hueToRgb(0))
+  })
+})
+
+describe("ringPaths", () => {
+  test("splits a 40x10 screen into mirrored top/side/rule legs", () => {
+    const { left, right } = ringPaths(40, 10)
+    expect(left).toEqual({ top: 20, side: 9, rule: 8, total: 37 })
+    expect(right).toEqual({ top: 20, side: 9, rule: 8, total: 37 })
+  })
+
+  test("a single-row screen has no side leg, and an odd width splits the top unevenly", () => {
+    const { right } = ringPaths(41, 1)
+    expect(right.top).toBe(21)
+    expect(right.side).toBe(0)
+  })
+})
+
 describe("AskPulseBanner.render", () => {
   const glyphs = {
     topLeft: "╭",
@@ -200,7 +257,13 @@ describe("AskPulseBanner.render", () => {
     horizontal: "─",
     vertical: "│",
   }
-  const palette = { colorB: [0x3d, 0x04, 0x3a], colorA: [0xff, 0x10, 0xf0], periodMs: 1200, holdAfterMs: 0 } as const
+  const palette = {
+    colorB: [0x3d, 0x04, 0x3a],
+    colorA: [0xff, 0x10, 0xf0],
+    periodMs: 1200,
+    holdAfterMs: 0,
+    rainbow: false,
+  } as const
   const banner = new AskPulseBanner(["Apply the migration?"], glyphs, palette)
   // ESC is assembled at runtime: a literal escape in a regex trips lint/suspicious/noControlCharactersInRegex.
   const ESC = String.fromCharCode(0x1b)
@@ -331,6 +394,52 @@ describe("AskPulseBanner.render", () => {
     })
   })
 
+  describe("idle rainbow wave", () => {
+    const BASE = 1_200_000
+    let clock: Mock<() => number>
+    const rainbowPalette = { ...palette, rainbow: true }
+
+    beforeEach(() => {
+      clock = spyOn(Date, "now")
+    })
+    afterEach(() => {
+      clock.mockRestore()
+    })
+
+    const idleAt = (now: number, holdAfterMs = 0) => {
+      clock.mockReturnValue(BASE)
+      const idle = new AskPulseBanner([], glyphs, { ...rainbowPalette, holdAfterMs })
+      clock.mockReturnValue(now)
+      const line = (idle.render(40) as string[])[0] as string
+      return { text: plain(line), triplets: [...line.matchAll(TRUECOLOR)].map((m) => m.slice(1).map(Number)) }
+    }
+
+    test("never flips: carets stay pointed inward while the hue flows", () => {
+      for (const now of [BASE, BASE + 300, BASE + 900, BASE + 1700]) {
+        expect(idleAt(now).text).toBe(`${">".repeat(8)} WAITING FOR YOUR INPUT ${"<".repeat(8)}`)
+      }
+    })
+
+    test("paints more than one color across the line", () => {
+      expect(idleAt(BASE).triplets.length).toBeGreaterThan(1)
+    })
+
+    test("the outermost left caret at u=0 sits at hue 0.5/8", () => {
+      const { triplets } = idleAt(BASE)
+      expect(triplets[0]).toEqual([...hueToRgb(0.5 / 8)])
+    })
+
+    test("the hue flows over time", () => {
+      expect(idleAt(BASE).triplets).not.toEqual(idleAt(BASE + 700).triplets)
+    })
+
+    test("locks to a static gradient once the hold window elapses", () => {
+      const first = idleAt(BASE + 60_000, 60_000).triplets
+      const second = idleAt(BASE + 120_000, 60_000).triplets
+      expect(first).toEqual(second)
+    })
+  })
+
   // The banner derives its phase from `Date.now()`, so the clock is the only input worth
   // controlling here — no sleeps, and the assertions are exact rather than "roughly bright".
   describe("hold window", () => {
@@ -379,6 +488,140 @@ describe("AskPulseBanner.render", () => {
         expect(first).toEqual([...palette.colorB])
       }
     })
+  })
+})
+
+describe("AskPulseStrip.render", () => {
+  const palette = {
+    colorB: [0x3d, 0x04, 0x3a],
+    colorA: [0xff, 0x10, 0xf0],
+    periodMs: 1200,
+    holdAfterMs: 0,
+    rainbow: false,
+  } as const
+  const ESC = String.fromCharCode(0x1b)
+  const SGR = new RegExp(`${ESC}\\[[0-9;]*m`, "g")
+  const plain = (line: string) => line.replaceAll(SGR, "")
+  const fakeHost = () => ({
+    terminal: { columns: 40, rows: 10 },
+    getFocused: () => null,
+    setFocus() {},
+    showOverlay() {
+      throw new Error("frame strips never call showOverlay on themselves")
+    },
+  })
+  const BASE = 1_200_000
+  let clock: Mock<() => number>
+
+  beforeEach(() => {
+    clock = spyOn(Date, "now")
+  })
+  afterEach(() => {
+    clock.mockRestore()
+  })
+
+  test("top strip renders one full-width line pointing outward at rest", () => {
+    clock.mockReturnValue(BASE)
+    const strip = new AskPulseStrip("top", fakeHost(), { palette, mountedAt: BASE, home: null })
+    expect(plain(strip.render(40)[0] as string)).toBe(`${"<".repeat(20)}${">".repeat(20)}`)
+  })
+
+  test("left strip renders one caret per side row, pointing outward at rest", () => {
+    clock.mockReturnValue(BASE)
+    const strip = new AskPulseStrip("left", fakeHost(), { palette, mountedAt: BASE, home: null })
+    expect((strip.render(1) as string[]).map(plain)).toEqual(Array(9).fill("v"))
+  })
+
+  test("half a period later, the top strip and side column have swept and flipped", () => {
+    clock.mockReturnValue(BASE)
+    const host = fakeHost()
+    const state = { palette, mountedAt: BASE, home: null }
+    const top = new AskPulseStrip("top", host, state)
+    const left = new AskPulseStrip("left", host, state)
+    clock.mockReturnValue(BASE + 600)
+    expect(plain(top.render(40)[0] as string)).toBe(`${">".repeat(20)}${"<".repeat(20)}`)
+    expect((left.render(1) as string[]).map(plain)).toEqual(Array(9).fill("^"))
+  })
+})
+
+describe("mountFrame", () => {
+  const palette = {
+    colorB: [0, 0, 0],
+    colorA: [255, 255, 255],
+    periodMs: 1200,
+    holdAfterMs: 0,
+    rainbow: false,
+  } as const
+
+  const makeHost = () => {
+    const received: string[] = []
+    const home = { handleInput: (data: string) => received.push(data) }
+    const calls: {
+      component: unknown
+      options: { anchor?: string; width?: unknown; maxHeight?: unknown; margin?: unknown; visible?: unknown }
+    }[] = []
+    const setFocusCalls: unknown[] = []
+    const handles: { hidden: boolean; hideCalls: number }[] = []
+    let focused: Component | null = home as unknown as Component
+    const host = {
+      terminal: { columns: 40, rows: 10 },
+      getFocused: () => focused,
+      setFocus(component: Component | null) {
+        focused = component
+        setFocusCalls.push(component)
+      },
+      showOverlay(component: unknown, options: unknown) {
+        calls.push({ component, options: options as never })
+        const handle = {
+          hidden: false,
+          hideCalls: 0,
+          hide() {
+            handle.hidden = true
+            handle.hideCalls++
+          },
+          setHidden(hidden: boolean) {
+            handle.hidden = hidden
+          },
+          isHidden() {
+            return handle.hidden
+          },
+        }
+        handles.push(handle)
+        return handle
+      },
+    }
+    return { host, calls, setFocusCalls, handles, home, received }
+  }
+
+  test("mounts three strips with the documented anchors and refocuses home after each", () => {
+    const { host, calls, setFocusCalls, home } = makeHost()
+    mountFrame(host, { palette, mountedAt: Date.now(), home: null })
+
+    expect(calls).toHaveLength(3)
+    expect(calls[0]?.options).toMatchObject({ anchor: "top-left", width: "100%", maxHeight: 1 })
+    expect(calls[1]?.options).toMatchObject({ anchor: "top-left", width: 1, margin: { top: 1 } })
+    expect(calls[2]?.options).toMatchObject({ anchor: "top-right", width: 1, margin: { top: 1 } })
+    for (const call of calls) expect(typeof call.options.visible).toBe("function")
+    expect(setFocusCalls).toEqual([home, home, home])
+  })
+
+  test("a strip forwards input to the recovered home and refocuses it", () => {
+    const { host, received } = makeHost()
+    const state = { palette, mountedAt: Date.now(), home: null }
+    mountFrame(host, state)
+    new AskPulseStrip("top", host, state).handleInput("x")
+    expect(received).toEqual(["x"])
+  })
+
+  test("hide() is idempotent: each handle hides exactly once, then focus returns home", () => {
+    const { host, handles, setFocusCalls, home } = makeHost()
+    const hide = mountFrame(host, { palette, mountedAt: Date.now(), home: null })
+    setFocusCalls.length = 0 // clear the three post-mount refocuses
+    hide()
+    hide()
+    expect(handles).toHaveLength(3)
+    for (const handle of handles) expect(handle.hideCalls).toBe(1)
+    expect(setFocusCalls).toEqual([home])
   })
 })
 
